@@ -1,4 +1,4 @@
-﻿import './styles.css'
+import './styles.css'
 import { api, connectSocket, getSocket, makeToast } from './game/network.js'
 import { drawTable, resetTableAnimation } from './game/renderer.js'
 import { Scene3D } from './game/scene3d.js'
@@ -8,23 +8,69 @@ import type { CueController } from './game/input.js'
 import { createHud, computePrizeCredits, describeBallOn, deriveHudState } from './game/hud.js'
 import type { Hud } from './game/hud.js'
 import { frameForHud } from './game/hudFrame.js'
-import { fitTableBox } from './game/layout.js'
 import { createShotTimer } from './game/shotTimerView.js'
 import type { TurnTiming } from './game/shotTimer.js'
 import type { ShotInput, ShotPlayback } from '@snooker/shared'
-import { STAKE_TIERS, COLOR_VALUES } from '@snooker/shared'
+import { APP_TITLE, STAKE_TIERS, COLOR_VALUES } from '@snooker/shared'
+import type { MatchFormat, PracticeAiLevel } from '@snooker/shared'
+import { createAvatarBadge } from './game/avatar.js'
+import {
+  DEFAULT_DIFFICULTY,
+  DIFFICULTIES,
+  HOME_BAR,
+  HOME_CARDS,
+  barDestination,
+  cardDestination,
+  comingSoonMessage
+} from './lobbyModel.js'
+import type { AppScreen } from './lobbyModel.js'
+import {
+  USE_NEW_LOBBY,
+  USE_LOADING_SCREEN,
+  mountGamingLobby,
+  showMatchLoading,
+  ensureLobbyBgReady
+} from './lobby/index.js'
+import type { LobbyBridge, LobbySession, LoadPhase } from './lobby/index.js'
 import type { Socket } from 'socket.io-client'
 import { playCushion, playFoul, playFrameEnd, playMatchEnd, playPot, setSoundMuted, isSoundMuted, unlockAudio } from './game/audio.js'
 import { ShotPlayer } from './game/playback.js'
 import type { PlaybackBall } from './game/playback.js'
 import { renderAuthScreen } from './auth.js'
 import { startAdminApp } from './adminLogin.js'
-import { placementAimAngle, placementShot } from './game/placement.js'
+import {
+  confirmPlacement,
+  initialPlacementFlow,
+  rejectPlacement,
+  placementAllowsGhostInput,
+  placementAllowsGameplayInput,
+  placementIsOver,
+  stepPlacementFlow
+} from './game/placement.js'
+import { PLAYER_CAMERA_MODES, PLACEMENT_TRANSITION_SECONDS, type PlayerCameraMode } from './game/camera.js'
 /** Radians of camera orbit per pixel of right-drag: a full-width drag sweeps half a turn. */
 const CAMERA_ORBIT_PER_PIXEL = Math.PI / 900
 
+/**
+ * How long the camera takes to fly into the overhead placement view and back out of it,
+ * in seconds.
+ *
+ * A named constant rather than a literal at each call site, because the two flights have
+ * to take the same time: a camera that goes up quickly and comes back slowly reads as two
+ * different events rather than one flow being entered and left. `clampPlacementTransitionSeconds`
+ * keeps it inside the 0.5-1.0s window whatever it is set to, so no value here can ask for
+ * a cut.
+ */
+const PLACEMENT_CAMERA_SECONDS = PLACEMENT_TRANSITION_SECONDS
+
 const app = document.querySelector<HTMLDivElement>('#app')!
 const toast = makeToast(document.body)
+
+/** Lobby cash HUD: balance as a dollar amount, no coin/gem metaphor. */
+function formatCash(amount: number | string): string {
+  const n = typeof amount === 'number' ? amount : Number(amount)
+  return `$${Math.max(0, Math.round(Number.isFinite(n) ? n : 0)).toLocaleString('en-US')}`
+}
 
 let token = localStorage.getItem('token') ?? ''
 let currentUser: { id: string; username: string; role: string; status: string } | null = null
@@ -48,19 +94,40 @@ let badgeEl: HTMLElement | null = null
 let panelEl: HTMLElement | null = null
 
 let activeMatchId: string | null = null
+/**
+ * Which of the screens behind a card or a bar icon is on.
+ *
+ * A screen rather than a URL: the app is one page and every one of these is a re-render,
+ * so the id only has to survive long enough to choose the branch in `render`. A match or
+ * a tournament still wins over it, because those are states rather than screens — you
+ * leave whichever screen you were on to go and play, and you come back to it.
+ */
+let activeScreen: AppScreen = 'home'
+/** The difficulty the setup screen opens on, kept so a trip to the lobby does not reset it. */
+let practiceDifficulty: PracticeAiLevel = DEFAULT_DIFFICULTY
+
 let mySeat: number | undefined
 let frame: FrameSnapshotData | null = null
 let cueController: CueController | null = null
 let scene3d: Scene3D | null = null
+/** One-shot build progress for the loading screen; cleared after Scene3D.create. */
+let pendingSceneBuildProgress: ((fraction: number) => void) | undefined
 /**
- * Which of the two views the player has asked for. The camera follows this rather than
+ * Which of the views the player has asked for. The camera follows this rather than
  * being told where to go, so the choice survives every shot: watching a shot put the camera
  * on the balls, and when the balls stop it comes back to whatever was asked for here.
  */
-let cameraMode: 'AIM' | 'TOP_DOWN' = 'AIM'
+let cameraMode: PlayerCameraMode = 'AIM'
 let cameraToggleEl: HTMLButtonElement | null = null
-/** True on the previous loop pass while a placement was live, so the end of one is detectable. */
-let placementWasActive = false
+/**
+ * Where the cue-ball placement flow currently stands: idle, flying the camera up to the
+ * overhead placement view, placing, or flying back to the gameplay view.
+ *
+ * This is the single source of truth for the whole flow. The camera moves, the overlays
+ * show and the input locks all read off the phase, so none of them can be right about
+ * what the flow is doing while another is wrong.
+ */
+let placementFlow = initialPlacementFlow()
 /** Where the pointer last sat on the cloth during placement, in table millimetres. */
 let placementTarget: { x: number; y: number } | null = null
 /** Whether the ghost is currently sitting on a legal spot. */
@@ -69,6 +136,19 @@ let placementLegal = false
 let placementPendingCommit: { x: number; y: number } | null = null
 /** Set when the placement click has been sent; cleared when the server's snapshot shows the cue down. */
 let placementCommitInFlight = false
+/**
+ * Whether the server is holding the strike clock for a placement this client has put down
+ * but not yet finished.
+ *
+ * The hold is released by a separate `placement:done`, sent when the camera lands back at
+ * the gameplay view. Set when the ball goes down, cleared once that message is on its way.
+ * It exists so the release is sent exactly once, and so it is never sent for a placement
+ * that was rejected - the server holds through a rejection for the retry, and releasing
+ * early would leave the retry to be played on a running clock.
+ */
+let placementResumePending = false
+/** Set once this placement has told the server the clock is to be held; reset per placement. */
+let placementDeclared = false
 /** The last pointer position over the canvas, in client pixels, for the placement ghost. */
 let lastPointerCanvas: { clientX: number; clientY: number } | null = null
 let myTurn = false
@@ -105,6 +185,13 @@ let connected = true
 let activeMatchIsPractice = false
 let activeTournamentId: string | null = null
 let tournamentTimer: number | undefined
+/**
+ * The mounted gaming lobby, so the next render can tear it down before drawing.
+ *
+ * The lobby holds document-level listeners (escape, fullscreen, resize); dropping its
+ * DOM without `destroy()` would leave one set behind per home ↔ tournaments round trip.
+ */
+let lobbySession: LobbySession | null = null
 let maintenanceMode = false
 let maintenanceEl: HTMLElement | null = null
 let opponentGone = false
@@ -138,16 +225,33 @@ let hintDismissed = false
 /** What the table is worth, read once from the match rather than recomputed. */
 let matchPrizeCredits = 0
 /**
- * The ceiling for the canvas backing store's device pixel ratio. 1.5 keeps a
- * high-DPI screen sharper than plain 1├ù while capping the fragment load that 4K
- * panels (DPR 2+) would otherwise put on a weak GPU; the adaptive ladder below
- * steps between 1 and this, and never above it.
+ * The ceiling for the canvas backing store's device pixel ratio.
+ *
+ * Two of them, because the right answer is a function of the screen rather than of the
+ * code: a phone has far fewer pixels to shade than a desktop at the same CSS size, so a
+ * DPR-3 phone rendering a full-bleed table at 3x is shading three times what a laptop is
+ * for the same picture. `DPR_CAP_DESKTOP` is sharp enough that a 2x panel is drawn at its
+ * native density and no denser, and `DPR_CAP_MOBILE` is the fallback for a small screen.
+ *
+ * `dprCap` is where the adaptive ladder actually sits: it starts at the ceiling chosen
+ * for this screen and only ever steps down, never below 1 and never above the ceiling.
  */
-let dprCap = 1.5
+const DPR_CAP_DESKTOP = 2
+const DPR_CAP_MOBILE = 1.5
+/** Below this on either axis the screen is treated as a phone rather than a desktop. */
+const DPR_MOBILE_MAX_EDGE = 820
+
+let dprCap = DPR_CAP_DESKTOP
+let dprCeiling = DPR_CAP_DESKTOP
 let frameEma = 0
 let lastFrameTime = 0
 let slowFrames = 0
 let lastDprUpAt = 0
+
+/** The ratio ceiling for the screen in front of us, recomputed on every match. */
+function dprCeilingForScreen(): number {
+  return Math.min(window.innerWidth, window.innerHeight) <= DPR_MOBILE_MAX_EDGE ? DPR_CAP_MOBILE : DPR_CAP_DESKTOP
+}
 
 const BALL_NAMES: Record<number, string> = {
   16: 'yellow',
@@ -165,8 +269,38 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
   return node
 }
 
-function header(): HTMLElement {
-  const head = el('header')
+/**
+ * The gold corner brackets around the identity badge.
+ *
+ * Four angles and nothing else. The frame they belong to is drawn by the corners rather
+ * than by a ring, because a ring reads as an outline of whatever it happens to be
+ * holding, whereas four corners read as a mount: the eye joins them across the middle and
+ * the portrait is left with a lip to sit behind. The stroke is one gradient in the page's
+ * gold, run diagonally, so the bracket nearest the brand is the brightest and the one
+ * opposite it is the deepest — the frame is lit rather than filled.
+ */
+function profileBadgeFrameSvg(): string {
+  return (
+    '<svg class="profile-badge-frame" viewBox="0 0 34 34" width="34" height="34" fill="none" aria-hidden="true">' +
+    '<defs>' +
+    '<linearGradient id="profile-badge-gold" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="34" y2="34">' +
+    '<stop offset="0" stop-color="#ffe6b0"/>' +
+    '<stop offset="0.45" stop-color="#ffb02e"/>' +
+    '<stop offset="1" stop-color="#b87613"/>' +
+    '</linearGradient>' +
+    '</defs>' +
+    '<path d="M2.5 10.5V5.5A3 3 0 0 1 5.5 2.5h5M23.5 2.5h5a3 3 0 0 1 3 3v5M31.5 23.5v5a3 3 0 0 1-3 3h-5M10.5 31.5h-5a3 3 0 0 1-3-3v-5" ' +
+    'stroke="url(#profile-badge-gold)" stroke-width="1.6" stroke-linecap="round"/>' +
+    '</svg>'
+  )
+}
+
+/**
+ * Lobby Header HUD: brand + single $ cash balance + slim profile menu.
+ * Match screens keep their own overlay; this bar is for lobby / setup only.
+ */
+function header(_options: { home?: boolean } = {}): HTMLElement {
+  const head = el('header', 'lobby-header')
 
   const brand = el('a', 'brand') as HTMLAnchorElement
   brand.href = '#'
@@ -176,99 +310,178 @@ function header(): HTMLElement {
   const logoIcon = el('span', 'brand-logo')
   logoIcon.innerHTML =
     '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#c9a84c"/><circle cx="12" cy="12" r="7" fill="#0a0a0f"/><circle cx="9.5" cy="9.5" r="2.5" fill="#e8c872"/></svg>'
-  brand.append(logoIcon, el('span', 'brand-name', 'Snooker Arena'))
+  brand.append(logoIcon, el('span', 'brand-name', APP_TITLE))
   head.appendChild(brand)
 
   const right = el('div', 'row header-actions')
   if (currentUser) {
-    // The avatar carries the first letter, so the player is recognisable at a glance
-    // and the two names in a scoreboard are told apart without reading them.
-    const chip = el('div', 'user-chip')
-    const avatar = el('span', 'user-avatar', (currentUser.username[0] ?? '?').toUpperCase())
-    avatar.setAttribute('aria-hidden', 'true')
-    const name = el('span', 'user-name')
-    name.appendChild(el('strong', undefined, currentUser.username))
-    chip.append(avatar, name)
-
-    const conn = el('span', connected ? 'chip-ok' : 'chip-bad', connected ? 'online' : 'reconnectingâ€¦')
-    conn.id = 'conn-chip'
-    conn.setAttribute('role', 'status')
-    chip.appendChild(conn)
-    right.appendChild(chip)
-
-    // The balance is its own chip so it is the thing that reads as a number, rather
-    // than a run-on sentence with the username.
-    const walletChip = el('div', 'wallet-chip')
+    // Single cash counter — no coins, gems, or CR suffix.
+    const walletChip = el('div', 'wallet-chip cash-hud')
     walletChip.id = 'wallet-chip'
-    walletChip.title = 'Virtual credits â€” no real money'
-    const coin = el('span', 'wallet-coin')
-    coin.setAttribute('aria-hidden', 'true')
-    coin.textContent = 'â—ˆ'
-    walletChip.append(coin, el('span', 'wallet-amount', `${wallet.balance} CR`))
+    walletChip.title = 'Account balance'
+    walletChip.appendChild(el('span', 'wallet-amount', formatCash(wallet.balance)))
     right.appendChild(walletChip)
 
     right.appendChild(renderBell())
 
+    // Avatar opens a compact menu for account actions so the HUD stays one balance + face.
+    const menuWrap = el('div', 'profile-menu')
+    const chip = el('button', 'user-chip user-chip-btn') as HTMLButtonElement
+    chip.type = 'button'
+    chip.setAttribute('aria-haspopup', 'menu')
+    chip.setAttribute('aria-expanded', 'false')
+    chip.title = currentUser.username
+    const badge = el('span', 'profile-badge')
+    badge.innerHTML = profileBadgeFrameSvg()
+    badge.appendChild(createAvatarBadge({ name: currentUser.username, isBot: false }))
+    const conn = el('span', connected ? 'chip-ok' : 'chip-bad', connected ? 'online' : 'reconnecting…')
+    conn.id = 'conn-chip'
+    conn.setAttribute('role', 'status')
+    badge.appendChild(conn)
+    chip.appendChild(badge)
+    const name = el('span', 'user-name')
+    name.appendChild(el('strong', undefined, currentUser.username))
+    chip.appendChild(name)
+
+    const dropdown = el('div', 'profile-menu-panel')
+    dropdown.setAttribute('role', 'menu')
+    dropdown.hidden = true
+
     if (currentUser.role === 'ADMIN' || currentUser.role === 'SUPERADMIN') {
-      const adminBtn = el('button', 'ghost', 'Admin') as HTMLButtonElement
+      const adminBtn = el('button', 'profile-menu-item', 'Admin') as HTMLButtonElement
       adminBtn.type = 'button'
+      adminBtn.setAttribute('role', 'menuitem')
       adminBtn.onclick = () => {
-        // A navigation, not a panel toggle. The admin surface authenticates with its
-        // own session and its own second factor, so it cannot be reached by
-        // flipping a flag in the player app - and the player bundle is never left
-        // holding the panel.
         window.location.href = '/admin'
       }
-      right.appendChild(adminBtn)
+      dropdown.appendChild(adminBtn)
     }
-    const logout = el('button', 'ghost', 'Logout') as HTMLButtonElement
+    const logout = el('button', 'profile-menu-item', 'Logout') as HTMLButtonElement
     logout.type = 'button'
+    logout.setAttribute('role', 'menuitem')
     logout.onclick = () => {
       token = ''
       localStorage.removeItem('token')
       currentUser = null
       activeMatchId = null
       activeTournamentId = null
+      activeScreen = 'home'
       clearTournamentTimer()
       leaveGameState()
       render()
     }
-    right.appendChild(logout)
+    dropdown.appendChild(logout)
+
+    chip.onclick = (e) => {
+      e.stopPropagation()
+      const open = dropdown.hidden
+      dropdown.hidden = !open
+      chip.setAttribute('aria-expanded', String(open))
+      if (open) {
+        const onDoc = (): void => {
+          dropdown.hidden = true
+          chip.setAttribute('aria-expanded', 'false')
+          document.removeEventListener('click', onDoc)
+        }
+        Promise.resolve().then(() => document.addEventListener('click', onDoc))
+      }
+    }
+
+    menuWrap.append(chip, dropdown)
+    right.appendChild(menuWrap)
   }
   head.appendChild(right)
   return head
 }
 
+/** What each view is called out loud, for the button's own label. */
+const CAMERA_VIEW_NAMES: Record<PlayerCameraMode, string> = {
+  AIM: 'cue ball',
+  BROADCAST: 'broadcast',
+  SIDE: 'side',
+  CLOSE: 'close-up',
+  TOP_DOWN: 'overhead'
+}
+
 /**
- * The two-view toggle.
+ * The mark each view draws inside the lens ring.
  *
- * The glyph shows the view the button switches *to*, which is the more useful of the two
- * readings while you are looking at the other one. The mark is a lens ring with a diagram
- * inside it: from behind the cue ball, a ball on a horizon with the cue above it; from
- * overhead, the table's own rectangle with its centre line.
+ * All five at the same 1.3 stroke weight, all taking their colour from `currentColor` so
+ * they inherit whatever the glass button is currently wearing:
+ *
+ *  - AIM is a camera seen from the side — body, lens, and the little viewfinder bump on
+ *    top — because that is the view you are in when you are lining a shot up.
+ *  - BROADCAST is a screen on a stand: the wide shot the venue is covered from.
+ *  - SIDE is a camera in profile on its tripod, which is the camera beside the table.
+ *  - CLOSE is a focus reticle, which is what a close camera does: frames one thing tight.
+ *  - TOP_DOWN is the table's own footprint with a ball sitting on it.
  */
-function cameraSvg(mode: 'AIM' | 'TOP_DOWN'): string {
+const CAMERA_DIAGRAMS: Record<PlayerCameraMode, (ink: string) => string> = {
+  AIM: (ink) =>
+    '<path d="M8.1 7.3V6.1a0.8 0.8 0 0 1 0.8-0.8h2.2a0.8 0.8 0 0 1 0.8 0.8v1.2" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3" stroke-linejoin="round"/>' +
+    '<rect x="4.4" y="7.3" width="11.2" height="7.3" rx="1.6" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<circle cx="10" cy="10.95" r="2.25" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>',
+  BROADCAST: (ink) =>
+    '<rect x="3.6" y="5.2" width="12.8" height="7.8" rx="1.5" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<path d="M8.6 7.6v3.2l2.9-1.6z" fill="' +
+    ink +
+    '"/>' +
+    '<path d="M10 13v2.3" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<path d="M7.4 15.9h5.2" stroke="' +
+    ink +
+    '" stroke-width="1.3" stroke-linecap="round"/>',
+  SIDE: (ink) =>
+    '<rect x="4.4" y="7.4" width="8.4" height="5.6" rx="1.6" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<path d="M12.8 8.9l3-1.4v6.4l-3-1.4" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3" stroke-linejoin="round"/>' +
+    '<path d="M8.6 13v2.6" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<path d="M6.4 16.3l2.2-2.9 2.2 2.9" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>',
+  CLOSE: (ink) =>
+    '<path d="M5.2 7.7V6.2a1 1 0 0 1 1-1h1.6M14.8 7.7V6.2a1 1 0 0 0-1-1h-1.6M5.2 12.3v1.5a1 1 0 0 0 1 1h1.6M14.8 12.3v1.5a1 1 0 0 1-1 1h-1.6" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3" stroke-linecap="round"/>' +
+    '<circle cx="10" cy="10" r="2.1" fill="' +
+    ink +
+    '"/>',
+  TOP_DOWN: (ink) =>
+    '<rect x="4.1" y="6.2" width="11.8" height="7.6" rx="1.5" fill="none" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<path d="M10 6.2v7.6" stroke="' +
+    ink +
+    '" stroke-width="1.3"/>' +
+    '<circle cx="7" cy="9.4" r="1.4" fill="' +
+    ink +
+    '"/>'
+}
+
+/**
+ * The view toggle's glyph, and which view it is right now.
+ *
+ * The mark always describes the mode you are currently looking at, not the one the button
+ * would switch to: there are more views than a two-state button could carry, so what the
+ * button says is "where you are", and pressing it walks on to the next one.
+ */
+function cameraSvg(mode: PlayerCameraMode): string {
   const ink = 'currentColor'
-  const diagram =
-    mode === 'AIM'
-      ? '<circle cx="10" cy="11.9" r="2.1" fill="' +
-        ink +
-        '"/>' +
-        '<path d="M3.4 15.5h13.2" stroke="' +
-        ink +
-        '" stroke-width="1.3" stroke-linecap="round"/>' +
-        '<path d="M10 4.1v3.9" stroke="' +
-        ink +
-        '" stroke-width="1.3" stroke-linecap="round"/>'
-      : '<rect x="4.1" y="6.2" width="11.8" height="7.6" rx="1.5" fill="none" stroke="' +
-        ink +
-        '" stroke-width="1.3"/>' +
-        '<path d="M10 6.2v7.6" stroke="' +
-        ink +
-        '" stroke-width="1.3"/>' +
-        '<circle cx="7" cy="9.4" r="1.4" fill="' +
-        ink +
-        '"/>'
+  const diagram = CAMERA_DIAGRAMS[mode](ink)
   return (
     '<svg viewBox="0 0 20 20" width="20" height="20" aria-hidden="true">' +
     '<circle cx="10" cy="10" r="8.4" fill="none" stroke="' +
@@ -279,26 +492,47 @@ function cameraSvg(mode: 'AIM' | 'TOP_DOWN'): string {
   )
 }
 
+/**
+ * The view toggle: cue ball, broadcast, side, close-up, overhead — and round again.
+ *
+ * Built as one of the HUD's own round glass buttons rather than as the loose circle it
+ * used to be, and mounted by the caller directly under Leave: the two controls a player
+ * reaches for between shots sit together in the corner, drawn in the same material as
+ * everything else on the edge of the screen.
+ *
+ * It is not a dead control. It walks the scene through the five views, it is disabled
+ * while the balls are moving or a placement is in flight (see the render loop), and the
+ * render loop hides it outright when the 2D fallback renderer is drawing, because then
+ * there is only one view.
+ */
 function buildCameraToggle(): HTMLButtonElement {
-  const btn = el('button', 'camera-toggle') as HTMLButtonElement
+  const btn = el('button', 'hud-tool hud-glass hud-tool--camera') as HTMLButtonElement
   btn.type = 'button'
   btn.onclick = () => {
-    setCameraMode(cameraMode === 'AIM' ? 'TOP_DOWN' : 'AIM')
+    const index = PLAYER_CAMERA_MODES.indexOf(cameraMode)
+    const next = PLAYER_CAMERA_MODES[(index + 1) % PLAYER_CAMERA_MODES.length]
+    setCameraMode(next ?? 'AIM')
   }
-  setCameraMode(cameraMode)
+  // Publish the element before asking it to paint itself. `setCameraMode` writes the glyph
+  // through `cameraToggleEl` and returns early when that is still null, so setting it after
+  // this call left the button built but empty until the player's first click.
   cameraToggleEl = btn
+  setCameraMode(cameraMode)
   return btn
 }
 
-function setCameraMode(mode: 'AIM' | 'TOP_DOWN'): void {
+function setCameraMode(mode: PlayerCameraMode): void {
   cameraMode = mode
   const btn = cameraToggleEl
   if (!btn) return
-  const switchingTo = mode === 'AIM' ? 'behind the cue ball' : 'overhead'
   btn.innerHTML = cameraSvg(mode)
-  btn.title = `Camera: ${mode === 'AIM' ? 'behind the cue ball' : 'overhead'} ΓÇö switch to ${switchingTo}`
-  btn.setAttribute('aria-label', btn.title)
-  btn.setAttribute('aria-pressed', mode === 'TOP_DOWN' ? 'true' : 'false')
+  // The view's own name in the label, and the state on the element as `data-mode`: five
+  // marks pass through this button, so the glyph cannot be what says which one it is on
+  // focus, and "pressed" would be a lie about four of the five.
+  const name = CAMERA_VIEW_NAMES[mode]
+  btn.title = `Camera view: ${name}`
+  btn.setAttribute('aria-label', `Camera view: ${name}`)
+  btn.setAttribute('data-mode', mode)
 }
 
 function bellSvg(): string {
@@ -533,7 +767,7 @@ async function refreshWallet(): Promise<void> {
   // the balance moves as stakes lock and settle, and the header is not re-rendered
   // for every state update, so without this the number on screen goes stale.
   const amount = document.querySelector<HTMLElement>('#wallet-chip .wallet-amount')
-  if (amount) amount.textContent = `${wallet.balance} CR`
+  if (amount) amount.textContent = formatCash(wallet.balance)
 }
 
 async function loadTiers(): Promise<void> {
@@ -586,15 +820,15 @@ function seatName(seat: number | undefined): string {
 function updateConnChip(): void {
   const chip = document.getElementById('conn-chip')
   if (!chip) return
-  chip.textContent = connected ? 'online' : 'reconnectingâ€¦'
+  chip.textContent = connected ? 'online' : 'reconnecting…'
   chip.className = connected ? 'chip-ok' : 'chip-bad'
 }
 
 /**
  * Feeds the HUD overlay from the authoritative frame state.
  *
- * Called on state changes only â€” a snapshot landing, a frame changing hands, the
- * replay finishing â€” and never from the render loop. The component diffs every write
+ * Called on state changes only — a snapshot landing, a frame changing hands, the
+ * replay finishing — and never from the render loop. The component diffs every write
  * before it makes it, so a call that changes nothing costs nothing.
  */
 function updateHud(): void {
@@ -606,7 +840,14 @@ function updateHud(): void {
     deriveHudState({
       snapshot: hudFrame,
       you: { name: currentUser?.username ?? 'You', isBot: false },
-      opponent: { name: opponentName(), isBot: activeMatchIsPractice },
+      // The robot gets the same face as the lobby's robot card rather than the letter
+      // fallback: a practice opponent you can pick out of the corner of your eye is the
+      // whole point of an avatar on a pill this small.
+      opponent: {
+        name: opponentName(),
+        isBot: activeMatchIsPractice,
+        avatarUrl: activeMatchIsPractice ? '/bot.png' : null
+      },
       mySeat,
       showMatchResult: matchPrizeCredits > 0,
       prizeCredits: matchPrizeCredits,
@@ -622,7 +863,7 @@ function updateOpponentGone(): void {
   const holder = document.getElementById('opp-holder')
   holder?.replaceChildren()
   if (opponentGone && !activeMatchIsPractice) {
-    holder?.appendChild(el('div', 'opp-gone', 'Opponent disconnected â€” waiting for them to return'))
+    holder?.appendChild(el('div', 'opp-gone', 'Opponent disconnected — waiting for them to return'))
   }
 }
 
@@ -689,6 +930,9 @@ async function finishPractice(): Promise<void> {
     await api('/practice/resign', { method: 'POST', body: { matchId: activeMatchId } })
     toast('Practice ended')
     leaveGameState()
+    // The session is over: back to the home screen rather than to a setup screen
+    // offering to start another one the player did not ask for.
+    activeScreen = 'home'
     render()
   } catch (error) {
     toast((error as Error).message, 'error')
@@ -699,6 +943,10 @@ function leaveToLobby(): void {
   leaveGameState()
   clearTournamentTimer()
   removeOverlay()
+  // Home is where every exit from a match lands, whichever screen the match was
+  // entered from. A tournament match keeps activeTournamentId set, so render still
+  // prefers the bracket over the home screen for that one case.
+  activeScreen = 'home'
   render()
 }
 
@@ -735,7 +983,8 @@ async function renderTournament(): Promise<void> {
   const wrap = el('div')
   app.appendChild(wrap)
   if (!activeTournamentId) {
-    void renderLobby()
+    activeScreen = 'home'
+    render()
     return
   }
   let data: TournamentData
@@ -743,9 +992,10 @@ async function renderTournament(): Promise<void> {
     data = await api<TournamentData>(`/tournaments/${activeTournamentId}`)
   } catch (error) {
     wrap.appendChild(el('div', 'muted', (error as Error).message))
-    const back = el('button', undefined, 'Back to lobby')
+    const back = el('button', undefined, 'Back to home')
     back.onclick = () => {
       activeTournamentId = null
+      activeScreen = 'home'
       render()
     }
     wrap.appendChild(back)
@@ -757,15 +1007,16 @@ async function renderTournament(): Promise<void> {
   const top = el('div', 'row t-top')
   const title = el('div')
   title.appendChild(el('h3', undefined, data.name))
-  title.appendChild(el('div', 'meta-line', `${data.players.length}/${data.size} players Â· ${statusLabel(data.status)} Â· BO${data.format.replace('BO', '')}`))
+  title.appendChild(el('div', 'meta-line', `${data.players.length}/${data.size} players · ${statusLabel(data.status)} · BO${data.format.replace('BO', '')}`))
   top.appendChild(title)
   const actions = el('div', 'row')
   const refreshBtn = el('button', 'ghost', 'Refresh')
   refreshBtn.onclick = () => void renderTournament()
   actions.appendChild(refreshBtn)
-  const backBtn = el('button', 'ghost', 'Back to lobby')
+  const backBtn = el('button', 'ghost', 'Back to home')
   backBtn.onclick = () => {
     activeTournamentId = null
+    activeScreen = 'home'
     render()
   }
   actions.appendChild(backBtn)
@@ -774,9 +1025,9 @@ async function renderTournament(): Promise<void> {
 
   if (data.status === 'OPEN' || data.status === 'DRAFT' || data.status === 'FULL') {
     if (data.players.length >= data.size) {
-      box.appendChild(el('div', 'muted', 'Everyone has joined â€” matches are starting.'))
+      box.appendChild(el('div', 'muted', 'Everyone has joined — matches are starting.'))
     } else {
-      box.appendChild(el('div', 'muted', `Waiting for ${data.size - data.players.length} more player${data.size - data.players.length === 1 ? '' : 's'} â€” bracket fills from the top seed down.`))
+      box.appendChild(el('div', 'muted', `Waiting for ${data.size - data.players.length} more player${data.size - data.players.length === 1 ? '' : 's'} — bracket fills from the top seed down.`))
     }
   }
 
@@ -786,9 +1037,9 @@ async function renderTournament(): Promise<void> {
     const banner = el('div', 'champion-banner')
     banner.appendChild(el('div', 'crown', 'CHAMPION'))
     banner.appendChild(el('div', 'champ-name', champion?.user.username ?? '?'))
-    banner.appendChild(el('div', 'meta-line', runnerUp ? `runner-up: ${runnerUp.user.username}` : 'runner-up: â€”'))
+    banner.appendChild(el('div', 'meta-line', runnerUp ? `runner-up: ${runnerUp.user.username}` : 'runner-up: —'))
     const mine = data.players.find((p) => p.userId === currentUser?.id)
-    banner.appendChild(el('div', 'meta-line', mine?.status === 'CHAMPION' ? 'This is you â€” take a bow.' : 'Free tournament Â· all 8 players started on even credits'))
+    banner.appendChild(el('div', 'meta-line', mine?.status === 'CHAMPION' ? 'This is you — take a bow.' : 'Free tournament · all 8 players started even'))
     box.appendChild(banner)
   }
 
@@ -857,7 +1108,7 @@ function bracketNode(slot: BracketSlotData, data: TournamentData): HTMLElement {
       node.appendChild(play)
     }
   }
-  node.title = match ? `${match.status} Â· round ${match.round ?? '?'}` : ''
+  node.title = match ? `${match.status} · round ${match.round ?? '?'}` : ''
   return node
 }
 
@@ -888,35 +1139,51 @@ async function finishMatch(winnerSeat: number, reason?: string): Promise<void> {
   const box = card('Match finished')
   box.appendChild(el('div', 'end-winner', `${winnerName} wins`))
   if (activeMatchIsPractice) {
-    box.appendChild(el('div', 'muted', 'Practice session â€” no credits involved'))
+    box.appendChild(el('div', 'muted', 'Practice session — free play'))
   } else {
     box.appendChild(el('div', 'muted', `Frames: ${framesWon[0]}-${framesWon[1]}`))
     const prize = meta?.resultJson?.prize
     if (typeof prize === 'number' && prize > 0) {
-      box.appendChild(el('div', 'end-prize', `Winner receives ${prize} CR`))
+      box.appendChild(el('div', 'end-prize', `Winner receives ${formatCash(prize)}`))
     } else {
-      box.appendChild(el('div', 'muted', 'Settlement pendingâ€¦'))
+      box.appendChild(el('div', 'muted', 'Settlement pending…'))
     }
   }
   if (reason === 'concede') box.appendChild(el('div', 'muted', 'by concession'))
-  const backBtn = el('button', undefined, activeTournamentId ? 'Back to tournament' : 'Back to lobby')
+  const backBtn = el('button', undefined, activeTournamentId ? 'Back to tournament' : 'Back to home')
   backBtn.onclick = () => leaveToLobby()
   box.appendChild(backBtn)
   showOverlay(box)
 }
 
+/**
+ * Draws whichever screen the player is on.
+ *
+ * A match and a tournament bracket are states rather than screens, so they are checked
+ * first: you leave a screen to go and play and you come back to it. The full-height
+ * shells are decided from the same list, because a screen that is one viewport tall has
+ * to be told so before its first child is measured, not after.
+ */
 function render(): void {
+  // The lobby owns document-level listeners, so it is torn down before the page is cleared.
+  lobbySession?.destroy()
+  lobbySession = null
   app.innerHTML = ''
-  // The game screen is the only full-height page; every other screen is a scrolling
-  // column, so the class is reset here rather than left behind by the last render.
-  app.className = 'app-root'
-  document.body.classList.remove('game-mode')
   hud = null
-  app.appendChild(header())
+  document.body.classList.remove('game-mode', 'home-mode', 'practice-mode')
+
+  const shell = activeMatchId ? 'app-game' : activeScreen === 'home' ? 'app-home' : activeScreen === 'practice' ? 'app-practice' : null
+  app.className = shell ? `app-root ${shell}` : 'app-root'
+  if (shell === 'app-home') document.body.classList.add('home-mode')
+  if (shell === 'app-practice') document.body.classList.add('practice-mode')
+
   if (!currentUser) {
     // The auth screen centres itself on the viewport, so the transition is applied to
-    // the card rather than to a wrapper â€” the wrapper would be a full-height block
+    // the card rather than to a wrapper — the wrapper would be a full-height block
     // and the animation would be invisible behind the card's own entrance.
+    app.className = 'app-root'
+    document.body.classList.remove('home-mode', 'practice-mode')
+    app.appendChild(header())
     renderAuthScreen(app, app, toast)
   } else if (activeMatchId) {
     // No page transition here: the game fits itself to the space the header and HUD
@@ -924,43 +1191,428 @@ function render(): void {
     // wrong for the duration of the animation.
     renderGame()
   } else if (activeTournamentId) {
+    app.appendChild(header())
     void renderTournament()
+  } else if (USE_NEW_LOBBY && activeScreen !== 'tournaments') {
+    // New gaming lobby UI (presentation only). Flip USE_NEW_LOBBY in lobby/flag.ts to restore the old lobby.
+    // `tournaments` is the exception: its tile hands back to the existing screen below,
+    // which is the same one the old lobby's Tournament card has always opened.
+    app.className = 'app-root app-home'
+    lobbySession = mountGamingLobby(app, createLobbyBridge())
+  } else if (activeScreen === 'home') {
+    app.appendChild(header({ home: true }))
+    renderHome()
+  } else if (activeScreen === 'practice') {
+    app.appendChild(header())
+    renderPracticeSetup()
   } else {
-    void renderLobby()
+    app.appendChild(header())
+    void renderScreen(activeScreen)
   }
 }
 
-async function renderLobby(): Promise<void> {
+/**
+ * Read-only bridge from the new lobby views into existing main.ts handlers and state.
+ * Does not change match start, audio, wallet, or API contracts — only exposes them.
+ */
+function createLobbyBridge(): LobbyBridge {
+  const logoSvg =
+    '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="10" fill="#c9a84c"/><circle cx="12" cy="12" r="7" fill="#0a0a0f"/><circle cx="9.5" cy="9.5" r="2.5" fill="#e8c872"/></svg>'
+  return {
+    appTitle: APP_TITLE,
+    username: currentUser?.username ?? 'Player',
+    userId: currentUser?.id ?? '',
+    walletBalance: wallet.balance,
+    logoSvg,
+    formatCash,
+    createAvatar: (name) => createAvatarBadge({ name, isBot: false }),
+    getSoundMuted: () => isSoundMuted(),
+    setSoundMuted: (muted) => setSoundMuted(muted),
+    practiceDifficulty,
+    setPracticeDifficulty: (level) => {
+      practiceDifficulty = level
+    },
+    getStakeTiers: () => tiers.map((t) => ({ id: t.id, label: t.label, credits: t.credits })),
+    getDefaultStakeTierId: () => activeTierId ?? tiers[0]?.id ?? null,
+    refreshWallet: async () => {
+      await Promise.all([refreshWallet(), loadTiers()])
+    },
+    fetchProfileStats: async () => {
+      try {
+        const profile = await api<MyProfile>('/me')
+        return profile.stats
+      } catch {
+        return null
+      }
+    },
+    fetchMatchHistory: async () => {
+      try {
+        return await api<HistoryMatch[]>('/matches/history')
+      } catch {
+        return []
+      }
+    },
+    startPractice: async (aiLevel) => {
+      practiceDifficulty = aiLevel
+      if (!USE_LOADING_SCREEN) {
+        const data = await api<{ id: string }>('/practice/start', { method: 'POST', body: { aiLevel } })
+        enterMatch(data.id, true)
+        return
+      }
+      await startPracticeWithLoadingScreen(aiLevel)
+    },
+    startOnlineMatch: async (opts) => {
+      const data = await api<{ id: string }>('/matches', {
+        method: 'POST',
+        body: { stakeTier: opts.stakeTier, format: opts.format as MatchFormat }
+      })
+      enterMatch(data.id, false)
+    },
+    toast: (message, kind) => toast(message, kind),
+    onProfileActivate: () => {
+      /* Settings tab is opened by the lobby shell; no separate profile route exists. */
+    },
+    openTournaments: () => {
+      activeScreen = 'tournaments'
+      render()
+    }
+  }
+}
+
+/**
+ * The home screen.
+ *
+ * Deliberately synchronous and deliberately empty of requests. Every element here is
+ * built from state the app already holds, so the screen is painted complete on the first
+ * frame and nothing reflows when something arrives: no skeletons, no reserved heights
+ * guessing at content, and no request that can fail halfway and leave a hole. The wallet
+ * the tables screen will want is fetched in the background, after the screen is up.
+ */
+function renderHome(): void {
+  void refreshWallet()
+
+  const page = el('div', 'home-page page-enter')
+
+  const title = el('div', 'home-title')
+  title.appendChild(el('h1', 'home-wordmark', APP_TITLE))
+  title.appendChild(el('div', 'home-tagline', 'Play online snooker'))
+  page.appendChild(title)
+
+  const cards = el('div', 'home-cards')
+  for (const spec of HOME_CARDS) {
+    // Hit box stays fixed; the face lifts. Card chrome is trimmed to emblem + title +
+    // one line + one fact + CTA so the home screen reads as a game lobby, not a dashboard.
+    const card = el('button', `home-card home-card--${spec.id}`) as HTMLButtonElement
+    card.type = 'button'
+
+    const face = el('span', 'home-card-face')
+    face.appendChild(el('span', 'home-card-skin'))
+    face.appendChild(el('span', 'home-card-grain'))
+    face.appendChild(el('span', 'home-card-shine'))
+    face.appendChild(el('span', 'home-card-sweep'))
+    face.appendChild(el('span', 'home-card-spark'))
+
+    const emblem = el('span', 'home-card-emblem')
+    emblem.innerHTML = spec.emblem
+    emblem.insertBefore(el('span', 'home-card-emblem-aura'), emblem.firstChild)
+    face.appendChild(emblem)
+
+    face.appendChild(el('span', 'home-card-title', spec.label))
+    face.appendChild(el('span', 'home-card-desc', spec.blurb))
+
+    const chips = el('span', 'home-card-chips')
+    chips.appendChild(el('span', 'home-chip', spec.chips[spec.statusIndex] ?? ''))
+    face.appendChild(chips)
+
+    const cta = el('span', 'home-card-cta')
+    cta.appendChild(el('span', 'home-card-cta-label', 'Play'))
+    face.appendChild(cta)
+
+    card.appendChild(face)
+    card.onclick = () => {
+      const target = cardDestination(spec.id)
+      if (!target) return
+      activeScreen = target
+      render()
+    }
+    cards.appendChild(card)
+  }
+  page.appendChild(cards)
+  page.appendChild(homeBar())
+  app.appendChild(page)
+}
+
+/**
+ * The bottom bar: five entries, all of them finished.
+ *
+ * Leaderboard and Settings go where they have always gone. Shop, Friends and More have
+ * no backend in this project, so they answer with a toast naming themselves rather than
+ * navigating or asking the server for anything — the entry points are real, the features
+ * behind them are not, and the bar does not pretend otherwise.
+ */
+function homeBar(): HTMLElement {
+  const bar = el('nav', 'home-bar glass glass-edge')
+  bar.setAttribute('aria-label', 'More screens')
+  for (const item of HOME_BAR) {
+    const destination = barDestination(item.id)
+    const locked = destination === null
+    const active = destination !== null && destination === activeScreen
+    const btn = el(
+      'button',
+      `home-bar-item${locked ? ' home-bar-item--locked' : ''}${active ? ' home-bar-item--active' : ''}`
+    ) as HTMLButtonElement
+    btn.type = 'button'
+    if (locked) btn.setAttribute('aria-disabled', 'true')
+    if (active) btn.setAttribute('aria-current', 'page')
+    const icon = el('span', 'home-bar-icon')
+    icon.innerHTML = item.icon
+    btn.append(icon, el('span', undefined, item.label))
+    btn.onclick = () => {
+      if (!destination) {
+        toast(comingSoonMessage(item.label))
+        return
+      }
+      activeScreen = destination
+      render()
+    }
+    bar.appendChild(btn)
+  }
+  return bar
+}
+
+/**
+ * The screens a card or a bar icon opens.
+ *
+ * All four were already in the app; what is new is that they each have a screen of their
+ * own with a way back, rather than sharing one long scrolling lobby with everything else
+ * on it. The builders below are the existing ones, unchanged — the flows they drive are
+ * the flows that shipped.
+ */
+async function renderScreen(screen: AppScreen): Promise<void> {
+  const wrap = el('div', 'screen-page page-enter')
+  app.appendChild(wrap)
+  switch (screen) {
+    case 'multiplayer':
+      await renderTablesScreen(wrap)
+      return
+    case 'tournaments':
+      await renderTournamentsScreen(wrap)
+      return
+    case 'leaderboard':
+      await renderLeaderboardScreen(wrap)
+      return
+    case 'settings':
+      renderSettingsScreen(wrap)
+      return
+    default:
+      activeScreen = 'home'
+      render()
+  }
+}
+
+/** The title and the way home, shared by every screen below. */
+function screenHead(title: string, note?: string): HTMLElement {
+  const head = el('div', 'screen-head')
+  const titles = el('div')
+  titles.appendChild(el('h2', 'screen-title', title))
+  if (note) titles.appendChild(el('div', 'muted', note))
+  head.appendChild(titles)
+  const back = el('button', 'ghost', 'Back to home') as HTMLButtonElement
+  back.type = 'button'
+  back.onclick = () => {
+    activeScreen = 'home'
+    render()
+  }
+  head.appendChild(back)
+  return head
+}
+
+/**
+ * One-to-one tables: the create-a-match card, the tiered list of tables waiting for a
+ * second player, and the player's own match history. All of it exactly as it was; the
+ * balance now sits with the tier chips, which is the only decision on this screen that
+ * belongs to credits.
+ */
+async function renderTablesScreen(wrap: HTMLElement): Promise<void> {
+  wrap.appendChild(screenHead('Multiplayer', 'Join a table by price, or open one and wait for an opponent.'))
   await Promise.all([refreshWallet(), loadTiers()])
-  app.innerHTML = ''
-  app.appendChild(header())
-
-  // One container for the whole page, so the entrance reads as a single movement.
-  // The header is left out deliberately: it is sticky, and animating a sticky
-  // element's transform would make it slide against its own sticky position.
-  const page = el('div', 'page-enter')
-
-  // Featured banner. Driven by the tournaments that are actually open for a seat,
-  // so the headline and the button always agree with each other.
-  page.appendChild(await featuredTournamentHero())
-
-  // Game mode cards
-  const grid = el('div', 'lobby-grid')
-  grid.appendChild(createMatchCard())
-  grid.appendChild(createPracticeCard())
-  grid.appendChild(createTournamentCard())
-  page.appendChild(grid)
+  if (!wrap.isConnected) return
+  wrap.appendChild(createMatchCard())
 
   // Tables that are open for a seat. The server only reports matches still waiting
   // for a second player, so this is a "join a waiting table" list rather than a
-  // spectator feed â€” calling it anything else would overstate what is being shown.
+  // spectator feed — calling it anything else would overstate what is being shown.
   const openSection = el('div', 'lobby-section')
   openSection.appendChild(el('h3', 'lobby-section-title', 'Open Tables'))
   openSection.appendChild(await openTablesStrip())
-  page.appendChild(openSection)
+  if (!wrap.isConnected) return
+  wrap.appendChild(openSection)
 
-  page.appendChild(await matchHistoryCard())
-  page.appendChild(await profileStatsCard())
+  wrap.appendChild(await matchHistoryCard())
+}
+
+/** The tournament banner and the create/join card: the existing flow, given its own screen. */
+async function renderTournamentsScreen(wrap: HTMLElement): Promise<void> {
+  wrap.appendChild(screenHead('Tournaments', '8-player single-elimination brackets, seeded by join order.'))
+  // Driven by the tournaments that are actually open for a seat, so the headline and
+  // the button always agree with each other.
+  wrap.appendChild(await featuredTournamentHero())
+  if (!wrap.isConnected) return
+  wrap.appendChild(createTournamentCard())
+}
+
+/** The leaderboard, which has had working logic since the profile phase. */
+async function renderLeaderboardScreen(wrap: HTMLElement): Promise<void> {
+  wrap.appendChild(screenHead('Leaderboard', 'Ranked on real matches only — practice never counts.'))
+  wrap.appendChild(await profileStatsCard())
+}
+
+/**
+ * Settings.
+ *
+ * Only what already works: the account as `/api/me` reports it, and the sound toggle,
+ * which is the same `audio.ts` mute the in-game button sets. Nothing here is stored
+ * anywhere new and nothing here is a placeholder for a feature — if a setting is added
+ * later it arrives here with its own logic rather than as a row that does nothing.
+ */
+function renderSettingsScreen(wrap: HTMLElement): void {
+  wrap.appendChild(screenHead('Settings'))
+
+  const account = card('Account')
+  const rows = el('div')
+  rows.appendChild(el('div', 'muted', 'Loading...'))
+  account.appendChild(rows)
+  void api<MyProfile>('/me')
+    .then((profile) => {
+      if (!rows.isConnected) return
+      rows.innerHTML = ''
+      const name = el('div', 'table-row')
+      name.appendChild(el('div', undefined, profile.user.username))
+      name.appendChild(el('span', 'badge', currentUser?.role ?? 'PLAYER'))
+      rows.appendChild(name)
+      const joined = el('div', 'table-row')
+      joined.appendChild(el('div', undefined, 'Member since'))
+      joined.appendChild(el('div', 'meta', new Date(profile.user.createdAt).toLocaleDateString()))
+      rows.appendChild(joined)
+      const credits = el('div', 'table-row')
+      credits.appendChild(el('div', undefined, 'Balance'))
+      credits.appendChild(el('div', 'meta', formatCash(profile.user.wallet.available)))
+      rows.appendChild(credits)
+    })
+    .catch((error: Error) => {
+      if (!rows.isConnected) return
+      rows.innerHTML = ''
+      rows.appendChild(el('div', 'muted', error.message))
+    })
+  wrap.appendChild(account)
+
+  const sound = card('Sound')
+  const row = el('div', 'row')
+  const toggle = el('button', 'ghost', isSoundMuted() ? 'Sound: off' : 'Sound: on') as HTMLButtonElement
+  toggle.type = 'button'
+  toggle.onclick = () => {
+    const next = !isSoundMuted()
+    setSoundMuted(next)
+    toggle.textContent = next ? 'Sound: off' : 'Sound: on'
+  }
+  row.appendChild(el('span', 'muted', 'Table sounds'))
+  row.appendChild(toggle)
+  sound.appendChild(row)
+  wrap.appendChild(sound)
+}
+
+/**
+ * The pre-practice setup screen.
+ *
+ * Reached from the PRACTICE card and doing one job: choose the level, then start the
+ * match through the same `POST /practice/start` the old lobby card used, with the same
+ * `enterMatch` behind it. Nothing about how a practice match is created, played or
+ * settled is touched here - this is a screen in front of an unchanged flow.
+ *
+ * The setup screen replaces a dropdown that lived inside the lobby grid. A `<select>` is
+ * the right control when the level is one field among five and the wrong one when it is
+ * the only decision the player came here to make: it hides two of the three options and
+ * says nothing about what they mean. Three panes on a glass panel say both, and the
+ * description under them is reserved space, so choosing a level never moves the button.
+ */
+function renderPracticeSetup(): void {
+  const page = el('div', 'practice-page page-enter')
+  const panel = el('div', 'practice-panel glass glass-edge')
+
+  const back = el('button', 'ghost practice-back', 'Back to home') as HTMLButtonElement
+  back.type = 'button'
+  back.onclick = () => {
+    activeScreen = 'home'
+    render()
+  }
+  panel.appendChild(back)
+
+  const heading = el('div', 'practice-heading')
+  heading.appendChild(el('h2', undefined, 'Practice match'))
+  panel.appendChild(heading)
+
+  // The matchup, in the two avatars that will actually be at the table: the player's own,
+  // drawn by the shared component from their name, and the robot.
+  const playerName = currentUser?.username ?? 'You'
+  const matchup = el('div', 'practice-matchup')
+  const you = el('div', 'practice-side')
+  you.appendChild(createAvatarBadge({ name: playerName, isBot: false }))
+  you.appendChild(el('div', 'practice-side-name', playerName))
+  const bot = el('div', 'practice-side')
+  bot.appendChild(createAvatarBadge({ name: 'Robot', isBot: true }))
+  bot.appendChild(el('div', 'practice-side-name', 'Robot'))
+  matchup.append(you, el('div', 'practice-vs', 'vs'), bot)
+  panel.appendChild(matchup)
+
+  panel.appendChild(el('div', 'practice-group-label', 'Robot level'))
+  const blurb = el('div', 'difficulty-blurb')
+  const group = el('div', 'difficulty-group')
+  group.setAttribute('role', 'radiogroup')
+  group.setAttribute('aria-label', 'Robot level')
+
+  // One paint function for the selection, so the three buttons and the description under
+  // them cannot disagree: it is called once on entry and again on every click.
+  const buttons: HTMLButtonElement[] = []
+  const paint = (): void => {
+    for (const btn of buttons) btn.setAttribute('aria-checked', String(btn.dataset.level === practiceDifficulty))
+    const chosen = DIFFICULTIES.find((d) => d.level === practiceDifficulty)
+    blurb.textContent = chosen?.blurb ?? ''
+  }
+  for (const spec of DIFFICULTIES) {
+    const btn = el('button', 'difficulty', spec.label) as HTMLButtonElement
+    btn.type = 'button'
+    btn.dataset.level = spec.level
+    btn.setAttribute('role', 'radio')
+    btn.onclick = () => {
+      practiceDifficulty = spec.level
+      paint()
+    }
+    buttons.push(btn)
+    group.appendChild(btn)
+  }
+  panel.appendChild(group)
+  paint()
+  panel.appendChild(blurb)
+
+  const actions = el('div', 'practice-actions')
+  const play = el('button', 'practice-play', 'Play') as HTMLButtonElement
+  play.type = 'button'
+  play.onclick = () => {
+    // Disabled on the way out so a second click cannot start a second practice match; the
+    // failure path puts it back, because nothing has happened yet in that case.
+    play.disabled = true
+    void api<{ id: string }>('/practice/start', { method: 'POST', body: { aiLevel: practiceDifficulty } })
+      .then((data) => enterMatch(data.id, true))
+      .catch((error: Error) => {
+        play.disabled = false
+        toast(error.message, 'error')
+      })
+  }
+  actions.appendChild(play)
+  actions.appendChild(el('div', 'practice-note', 'Practice is free and does not count toward your record.'))
+  panel.appendChild(actions)
+
+  page.appendChild(panel)
   app.appendChild(page)
 }
 
@@ -1004,8 +1656,8 @@ async function featuredTournamentHero(): Promise<HTMLElement> {
       el(
         'p',
         undefined,
-        `${featured._count?.players ?? 0}/${featured.size} players signed up Â· ` +
-          `${fee > 0 ? `${fee} CR entry` : 'free entry'} Â· ${statusLabel(featured.status)}`
+        `${featured._count?.players ?? 0}/${featured.size} players signed up · ` +
+          `${fee > 0 ? `${formatCash(fee)} entry` : 'free entry'} · ${statusLabel(featured.status)}`
       )
     )
 
@@ -1023,7 +1675,7 @@ async function featuredTournamentHero(): Promise<HTMLElement> {
       joinBtn.onclick = () => {
         // Disable before the request so a double click cannot burn two entries.
         joinBtn.disabled = true
-        joinBtn.textContent = 'JOININGâ€¦'
+        joinBtn.textContent = 'JOINING…'
         void api<{ joined: boolean }>('/tournaments/join', {
           method: 'POST',
           body: { tournamentId: featured.id }
@@ -1042,7 +1694,7 @@ async function featuredTournamentHero(): Promise<HTMLElement> {
     }
   } else {
     content.appendChild(el('h2', undefined, 'No tournament open yet'))
-    content.appendChild(el('p', undefined, 'Be the first to put a bracket on the board â€” 8 players, seeded by join order.'))
+    content.appendChild(el('p', undefined, 'Be the first to put a bracket on the board — 8 players, seeded by join order.'))
     const createBtn = el('button', undefined, 'CREATE ONE') as HTMLButtonElement
     createBtn.type = 'button'
     createBtn.onclick = () => {
@@ -1102,9 +1754,9 @@ async function openTablesStrip(): Promise<HTMLElement> {
 function openTableCard(match: LobbyMatch, isMine: boolean): HTMLElement {
   const c = el('div', 'live-table-card')
   const host = match.players[0]?.user.username ?? 'Unknown'
-  c.appendChild(el('div', 'table-name', isMine ? 'Your table' : `${host} Â· ${match.format}`))
+  c.appendChild(el('div', 'table-name', isMine ? 'Your table' : `${host} · ${match.format}`))
   c.appendChild(el('div', 'table-players', isMine ? 'Waiting for an opponent' : 'Open seat'))
-  c.appendChild(el('div', 'table-score', `${match.stakePerPlayer} CR`))
+  c.appendChild(el('div', 'table-score', formatCash(match.stakePerPlayer)))
 
   if (isMine) {
     const badge = el('span', 'badge', 'waiting')
@@ -1138,8 +1790,17 @@ function createMatchCard(): HTMLElement {
     return c
   }
   let createTier = activeTierId ?? tiers[0]!.id
+
+  // The balance, immediately above the tiers it pays for. This is the only place in the
+  // new home flow where the number is worth showing: the home screen leads with who you
+  // are, and this screen is where credits are about to be committed to a table.
+  const balance = el('div', 'stake-wallet')
+  balance.appendChild(el('span', undefined, 'Balance'))
+  balance.appendChild(el('strong', undefined, formatCash(wallet.balance)))
+  c.appendChild(balance)
+
   for (const tier of tiers) {
-    const chip = el('button', 'tier-chip', `${tier.label} Â· ${tier.credits} CR`)
+    const chip = el('button', 'tier-chip', `${tier.label} · ${formatCash(tier.credits)}`)
     chip.dataset.tier = tier.id
     if (tier.id === createTier) chip.classList.add('active')
     chip.onclick = () => {
@@ -1174,37 +1835,11 @@ function createMatchCard(): HTMLElement {
   return c
 }
 
-function createPracticeCard(): HTMLElement {
-  const c = el('div', 'lobby-card')
-  const icon = el('div', 'lobby-card-icon', 'ðŸ¤–')
-  c.appendChild(icon)
-  c.appendChild(el('h3', undefined, 'Practice'))
-  c.appendChild(el('p', undefined, 'Train against the robot'))
-  const levelSelect = el('select') as HTMLSelectElement
-  for (const level of ['EASY', 'MEDIUM', 'HARD']) {
-    const option = el('option') as HTMLOptionElement
-    option.value = level
-    option.textContent = level
-    levelSelect.appendChild(option)
-  }
-  const startBtn = el('button', undefined, 'Start Practice')
-  startBtn.onclick = () =>
-    void api<{ id: string }>('/practice/start', { method: 'POST', body: { aiLevel: levelSelect.value } })
-      .then((data) => enterMatch(data.id, true))
-      .catch((error) => toast(error.message, 'error'))
-  const row = el('div', 'row')
-  const levelLabel = el('label', undefined, 'Robot level')
-  levelLabel.appendChild(levelSelect)
-  row.append(levelLabel, startBtn)
-  c.appendChild(row)
-  return c
-}
-
 /**
  * Creates a tournament, takes the first seat in it and opens the bracket.
  *
  * Shared by the tournament card and the lobby banner's empty state, so the two
- * cannot drift apart â€” and so the banner does not have to build a whole card (and
+ * cannot drift apart — and so the banner does not have to build a whole card (and
  * the tournament list request behind it) just to click one button on it.
  */
 function startTournament(): Promise<void> {
@@ -1222,7 +1857,7 @@ function startTournament(): Promise<void> {
 }
 
 function createTournamentCard(): HTMLElement {
-  const c = card('8-Player Tournament â€” free')
+  const c = card('8-Player Tournament — free')
   c.appendChild(el('div', 'muted', 'Single-elimination, best-of-3 frames. 8 players, seeded by join order. Winner takes the crown.'))
   const createBtn = el('button', undefined, 'Create Tournament') as HTMLButtonElement
   createBtn.type = 'button'
@@ -1236,7 +1871,7 @@ function createTournamentCard(): HTMLElement {
 }
 
 async function loadTournamentLists(c: HTMLElement): Promise<void> {
-  const loading = el('div', 'muted', 'Loading tournamentsâ€¦')
+  const loading = el('div', 'muted', 'Loading tournaments…')
   c.appendChild(loading)
   let open: OpenTournament[] = []
   let mine: OpenTournament[] = []
@@ -1256,7 +1891,7 @@ async function loadTournamentLists(c: HTMLElement): Promise<void> {
   const openHead = el('div', 'subhead', 'Open tournaments')
   c.appendChild(openHead)
   if (!open.length) {
-    c.appendChild(el('div', 'muted', 'None. Create one above â€” first to join takes seed 1.'))
+    c.appendChild(el('div', 'muted', 'None. Create one above — first to join takes seed 1.'))
   } else {
     for (const t of open) {
       const inMine = mine.some((m) => m.id === t.id)
@@ -1264,7 +1899,7 @@ async function loadTournamentLists(c: HTMLElement): Promise<void> {
       const rowEl = el('div', 'table-row')
       const info = el('div')
       info.appendChild(el('div', undefined, t.name))
-      info.appendChild(el('div', 'meta', `${count}/${t.size ?? 8} players Â· ${statusLabel(t.status)} Â· ${timeAgo(t.createdAt)}`))
+      info.appendChild(el('div', 'meta', `${count}/${t.size ?? 8} players · ${statusLabel(t.status)} · ${timeAgo(t.createdAt)}`))
       rowEl.appendChild(info)
       if (inMine) {
         rowEl.appendChild(el('span', 'badge', 'joined'))
@@ -1290,7 +1925,7 @@ async function loadTournamentLists(c: HTMLElement): Promise<void> {
       const rowEl = el('div', 'table-row')
       const info = el('div')
       info.appendChild(el('div', undefined, t.name))
-      info.appendChild(el('div', 'meta', `${t._count?.players ?? 8}/${t.size ?? 8} players Â· ${statusLabel(t.status)}`))
+      info.appendChild(el('div', 'meta', `${t._count?.players ?? 8}/${t.size ?? 8} players · ${statusLabel(t.status)}`))
       rowEl.appendChild(info)
       const viewBtn = el('button', 'ghost', 'Bracket')
       viewBtn.onclick = () => {
@@ -1308,8 +1943,8 @@ async function loadTournamentLists(c: HTMLElement): Promise<void> {
       const champion = t.players?.[0]?.user?.username
       const rowEl = el('div', 'table-row')
       const info = el('div')
-      info.appendChild(el('div', undefined, `${t.name} â€” winner: ${champion ?? '?'}`))
-      info.appendChild(el('div', 'meta', `${t._count?.players ?? 8} players Â· ${t.finishedAt ? new Date(t.finishedAt).toLocaleDateString() : ''}`))
+      info.appendChild(el('div', undefined, `${t.name} — winner: ${champion ?? '?'}`))
+      info.appendChild(el('div', 'meta', `${t._count?.players ?? 8} players · ${t.finishedAt ? new Date(t.finishedAt).toLocaleDateString() : ''}`))
       rowEl.appendChild(info)
       const viewBtn = el('button', 'ghost', 'Bracket')
       viewBtn.onclick = () => {
@@ -1323,10 +1958,10 @@ async function loadTournamentLists(c: HTMLElement): Promise<void> {
 }
 
 async function tablesCard(): Promise<HTMLElement> {
-  const c = card('Tables â€” pick your price')
+  const c = card('Tables — pick your price')
   const actions = el('div', 'row')
   const refreshBtn = el('button', 'ghost', 'Refresh tables')
-  refreshBtn.onclick = () => void renderLobby()
+  refreshBtn.onclick = () => void renderScreen('multiplayer')
   actions.appendChild(refreshBtn)
   c.appendChild(actions)
   try {
@@ -1344,7 +1979,7 @@ async function tablesCard(): Promise<HTMLElement> {
     const tabRow = el('div', 'row tabs')
     for (const tier of tiers) {
       const count = counts.get(tier.id) ?? 0
-      const tab = el('button', 'tab', `${tier.label}${count ? ` Â· ${count}` : ''}`)
+      const tab = el('button', 'tab', `${tier.label}${count ? ` · ${count}` : ''}`)
       tab.dataset.tier = tier.id
       if (tier.id === activeTierId) tab.classList.add('active')
       tab.onclick = () => {
@@ -1365,7 +2000,7 @@ async function tablesCard(): Promise<HTMLElement> {
       const section = el('div', 'tier-section')
       section.dataset.tier = tier.id
       if (tier.id !== activeTierId) section.classList.add('hidden')
-      section.appendChild(el('div', 'muted', `${tier.usd} USD Â· ${tier.credits} CR stake per player`))
+      section.appendChild(el('div', 'muted', `${formatCash(tier.credits)} stake per player`))
       if (!matches.length) {
         section.appendChild(el('div', 'muted', 'No tables waiting at this price. Create one above.'))
       } else {
@@ -1374,8 +2009,8 @@ async function tablesCard(): Promise<HTMLElement> {
           const host = match.players[0]
           const mine = host !== undefined && host.userId === currentUser?.id
           const info = el('div')
-          info.appendChild(el('div', undefined, `${mine ? 'You' : host?.user.username ?? '?'} Â· ${match.format}`))
-          info.appendChild(el('div', 'meta', `${match.stakePerPlayer} CR Â· waiting 1/2 Â· ${timeAgo(match.createdAt)}`))
+          info.appendChild(el('div', undefined, `${mine ? 'You' : host?.user.username ?? '?'} · ${match.format}`))
+          info.appendChild(el('div', 'meta', `${formatCash(match.stakePerPlayer)} · waiting 1/2 · ${timeAgo(match.createdAt)}`))
           wait.appendChild(info)
           if (mine) {
             wait.appendChild(el('span', 'badge', 'waiting for opponent'))
@@ -1486,12 +2121,12 @@ async function profileStatsCard(): Promise<HTMLElement> {
 
   const renderBoard = (period: string): void => {
     boardBox.innerHTML = ''
-    boardBox.appendChild(el('div', 'muted', 'Loading leaderboardâ€¦'))
+    boardBox.appendChild(el('div', 'muted', 'Loading leaderboard…'))
     void api<LeaderboardData>(`/leaderboard?period=${period}`)
       .then((data) => {
         boardBox.innerHTML = ''
         if (!data.rows.length) {
-          boardBox.appendChild(el('div', 'muted', 'No ranked matches yet â€” play a real match to get on the board.'))
+          boardBox.appendChild(el('div', 'muted', 'No ranked matches yet — play a real match to get on the board.'))
           return
         }
         const table = el('table')
@@ -1537,6 +2172,132 @@ async function profileStatsCard(): Promise<HTMLElement> {
   return c
 }
 
+/**
+ * VS AI start path with the match loading overlay: real phase progress, GPU warm-up,
+ * then handover. Online play keeps using `startOnlineMatch` unchanged — wire the same
+ * helper there later when that flow should share this screen.
+ */
+async function startPracticeWithLoadingScreen(aiLevel: PracticeAiLevel): Promise<void> {
+  const loading = showMatchLoading({ modeLabel: 'VS AI' })
+  const perf = new URLSearchParams(location.search).has('perf')
+  const phaseMs: Partial<Record<LoadPhase | 'total', number>> = {}
+  const runPhase = async (phase: LoadPhase, work: () => Promise<void> | void): Promise<void> => {
+    const t0 = performance.now()
+    loading.report(phase, 0)
+    try {
+      await work()
+    } catch (err) {
+      console.warn(`[match-loading] phase ${phase} failed; continuing`, err)
+    }
+    loading.report(phase, 1)
+    phaseMs[phase] = performance.now() - t0
+  }
+
+  const tAll = performance.now()
+  try {
+    await runPhase('fonts', async () => {
+      await Promise.all([document.fonts.ready.catch(() => undefined), ensureLobbyBgReady()])
+    })
+
+    // Network must succeed: without a match id there is nothing to warm. Do not swallow.
+    loading.report('network', 0)
+    const tNet = performance.now()
+    let matchId: string
+    try {
+      const data = await api<{ id: string }>('/practice/start', { method: 'POST', body: { aiLevel } })
+      matchId = data.id
+      loading.report('network', 1)
+      phaseMs.network = performance.now() - tNet
+    } catch (err) {
+      await loading.finish().catch(() => undefined)
+      throw err
+    }
+
+    await runPhase('scene', async () => {
+      pendingSceneBuildProgress = (fraction) => loading.report('scene', fraction)
+      enterMatch(matchId, true)
+      pendingSceneBuildProgress = undefined
+    })
+
+    await runPhase('audio', async () => {
+      await warmMatchAudioBuffers()
+    })
+
+    if (scene3d) {
+      const warmPhases: Array<'textures' | 'shaders' | 'bakes' | 'warmup'> = [
+        'textures',
+        'shaders',
+        'bakes',
+        'warmup'
+      ]
+      const seen = new Set<string>()
+      const tWarm = performance.now()
+      await scene3d.warmUp(
+        (phase, fraction) => {
+          loading.report(phase, fraction)
+          if (fraction >= 1 && !seen.has(phase)) {
+            seen.add(phase)
+            phaseMs[phase] = performance.now() - tWarm
+          }
+        },
+        { perf }
+      )
+      for (const p of warmPhases) {
+        if (!seen.has(p)) loading.report(p, 1)
+      }
+    } else {
+      for (const p of ['textures', 'shaders', 'bakes', 'warmup'] as const) {
+        loading.report(p, 1)
+      }
+    }
+
+    const before = scene3d?.rendererInfo() ?? { programs: 0, textures: 0 }
+    if (perf) {
+      phaseMs.total = performance.now() - tAll
+      console.info('[perf] match loading phases (ms)', phaseMs)
+      console.info('[perf] renderer.info before handover', before)
+    }
+
+    await loading.finish()
+
+    if (perf) {
+      window.setTimeout(() => {
+        const after = scene3d?.rendererInfo() ?? { programs: 0, textures: 0 }
+        console.info('[perf] renderer.info 3s after handover', after)
+        if (before.programs !== after.programs || before.textures !== after.textures) {
+          console.warn('[perf] renderer.info mismatch after handover', { before, after })
+        }
+      }, 3000)
+    }
+  } catch (err) {
+    console.warn('[match-loading] aborting overlay after error', err)
+    await loading.finish().catch(() => undefined)
+    throw err
+  }
+}
+
+/** Prefetch / decode crowd applause and unlock the audio context hooks. */
+async function warmMatchAudioBuffers(): Promise<void> {
+  unlockAudio()
+  try {
+    const res = await fetch('/audio/clapping-best.mp4', { cache: 'force-cache' })
+    if (!res.ok) return
+    const bytes = await res.arrayBuffer()
+    const AC =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+    if (!AC) return
+    const ctx = new AC()
+    try {
+      await ctx.decodeAudioData(bytes.slice(0))
+    } finally {
+      await ctx.close().catch(() => undefined)
+    }
+  } catch {
+    /* crowd file missing or decode unsupported — skip */
+  }
+}
+
 function enterMatch(matchId: string, isPractice = false): void {
   activeMatchId = matchId
   activeMatchIsPractice = isPractice
@@ -1553,23 +2314,31 @@ function enterMatch(matchId: string, isPractice = false): void {
 }
 
 /**
- * Fits the table to the space the layout has left over and sizes the canvas to match.
+ * Sizes the canvas to the space the layout has left over.
  *
- * Measured off the stage rather than the window, so the HUD and the controls can take
- * their space first and the page still ends up exactly one screen tall. The fitting
- * itself is in game/layout.ts, where it can be tested without a page.
+ * The stage is now the viewport (see `.game-page` / `.table-stage`), so there is nothing
+ * to fit the table into: the canvas takes the whole box, at whatever shape the window is.
+ * That is safe for both views because the cameras fit themselves to the aspect they are
+ * given — `topDownHeight` solves for whichever of length and width binds first — so the
+ * overhead view still arrives with the whole table in it, and the aim view gets a wider
+ * field of view on a wide window rather than bars down either side.
+ *
+ * The backing store is the CSS box times the device pixel ratio, capped (see `dprCap`),
+ * and the element's own CSS size stays 100%, so the renderer draws at the device's density
+ * without the layout ever being told about it.
+ *
+ * Measured off the stage rather than the window so the stage's own box is the truth. The
+ * ResizeObserver in `renderGame` calls this on every change to that box, which covers a
+ * window resize and an orientation change alike: a fixed, inset-0 stage is exactly the
+ * viewport, so it changes whenever the viewport does.
  */
 function applyCanvasSize(): void {
   const canvas = rgCanvas
   const stage = tableStageEl
   if (!canvas || !stage) return
-  const { width, height } = fitTableBox(stage.clientWidth, stage.clientHeight)
+  const width = Math.floor(stage.clientWidth)
+  const height = Math.floor(stage.clientHeight)
   if (width <= 0 || height <= 0) return
-  const frame = canvas.parentElement
-  if (frame instanceof HTMLElement) {
-    frame.style.width = `${width}px`
-    frame.style.height = `${height}px`
-  }
   const dpr = Math.min(dprCap, window.devicePixelRatio || 1)
   const w = Math.max(320, Math.floor(width * dpr))
   const h = Math.max(180, Math.floor(height * dpr))
@@ -1584,7 +2353,7 @@ function updateNetOverlay(): void {
   netOverlayEl.style.display = show ? 'flex' : 'none'
   const text = netOverlayEl.querySelector('p')
   if (text) {
-    text.textContent = !navigator.onLine ? 'You are offline â€” reconnectingâ€¦' : 'Connection lost â€” reconnectingâ€¦'
+    text.textContent = !navigator.onLine ? 'You are offline — reconnecting…' : 'Connection lost — reconnecting…'
   }
 }
 
@@ -1592,7 +2361,10 @@ function renderGame(): void {
   app.innerHTML = ''
   app.className = 'app-root app-game'
   document.body.classList.add('game-mode')
-  app.appendChild(header())
+  // No app header on this screen. It is a lobby control bar - brand, wallet, bell, sign
+  // out - and a match is one full viewport of table, so anything above the cloth is height
+  // the table does not get. The things a player needs mid-frame are the icon controls in
+  // the HUD's own top-left instead, and leaving is one of them.
   const page = el('div', 'game-page')
 
   // The HUD is mounted once and then only updated. Both renderers read from the same
@@ -1605,12 +2377,12 @@ function renderGame(): void {
   const canvas = el('canvas') as HTMLCanvasElement
   canvas.id = 'game-canvas'
   canvas.setAttribute('role', 'img')
-  canvas.setAttribute('aria-label', 'Snooker table â€” aim with pointer or touch, arrows for spin, Space to shoot')
+  canvas.setAttribute('aria-label', 'Snooker table — aim with pointer or touch, arrows for spin, Space to shoot')
   rgCanvas = canvas
   tableStageEl = stage
   tableFrame.appendChild(canvas)
   // Placement guidance sits under the table and speaks only while it has
-  // something to say ΓÇö a D restriction, a crowded spot ΓÇö then goes quiet.
+  // something to say — a D restriction, a crowded spot — then goes quiet.
   const placementHint = el('div', 'placement-hint')
   placementHint.id = 'placement-hint'
   placementHint.hidden = true
@@ -1625,7 +2397,10 @@ function renderGame(): void {
   })
   canvas.addEventListener('pointerdown', (e) => {
     lastPointerCanvas = { clientX: e.clientX, clientY: e.clientY }
-    if (!isPlacing() || placementCommitInFlight) return
+    // Only a placement in the `PLACING` phase accepts a click. During either camera move
+    // the click is consumed and dropped, so a player who clicks while the table is still
+    // lifting cannot commit a spot from a view that has not finished moving.
+    if (!placementAllowsGhostInput(placementFlow) || placementCommitInFlight) return
     const rect = canvas.getBoundingClientRect()
     const px = ((e.clientX - rect.left) / rect.width) * canvas.width
     const py = ((e.clientY - rect.top) / rect.height) * canvas.height
@@ -1635,13 +2410,10 @@ function renderGame(): void {
     e.preventDefault()
   })
   const overlay = el('div', 'net-overlay')
-  overlay.appendChild(el('p', undefined, 'Connection lost â€” reconnectingâ€¦'))
+  overlay.appendChild(el('p', undefined, 'Connection lost — reconnecting…'))
   tableFrame.appendChild(overlay)
   netOverlayEl = overlay
   updateNetOverlay()
-  // The view toggle sits on the frame rather than in the page flow, top left, clear of the
-  // power rail on the right and the score above.
-  tableFrame.appendChild(buildCameraToggle())
   const oppHolder = el('div')
   oppHolder.id = 'opp-holder'
   tableFrame.appendChild(oppHolder)
@@ -1651,57 +2423,206 @@ function renderGame(): void {
   stage.appendChild(tableFrame)
   page.appendChild(stage)
 
-  const bar = el('div', 'controls-bar')
-  if (!hintDismissed) {
-    const hint = el('div', 'controls-hint')
-    hint.appendChild(
-      el('span', undefined, 'Aim: mouse or touch Â· Power: drag the slider, hold to charge, or â†‘/â†“ to trim Â· Spin: â†/â†’ side, W/S top-bottom Â· Shoot: release or Space')
-    )
-    const dismiss = el('button', 'hint-close', 'Ã—')
-    dismiss.title = 'Hide these controls for this session'
-    dismiss.setAttribute('aria-label', 'Hide the controls hint')
-    dismiss.onclick = () => {
-      hintDismissed = true
-      hint.remove()
-    }
-    hint.appendChild(dismiss)
-    bar.appendChild(hint)
+  /**
+   * The session tools, icon-only round glass buttons in the HUD's own corners.
+   *
+   * They are icon-only because they are needed occasionally, not per shot, and the row of
+   * words under the table was the one thing on the screen wide enough to change its layout.
+   * Each button keeps its label in `title` and `aria-label`, so nothing is lost by dropping
+   * the text, and these are the handlers those buttons already had: this changes how they
+   * are drawn, not what they do.
+   *
+   * The mount is a parameter rather than a closure over one slot, because there are two
+   * slots now and only the first three of these belong in either of them: leaving and the
+   * view toggle in the top-left column, everything else in the top-right group.
+   */
+  const tool = (mount: HTMLElement, label: string, mark: string) => {
+    const btn = el('button', 'hud-tool hud-glass') as HTMLButtonElement
+    btn.type = 'button'
+    btn.title = label
+    btn.setAttribute('aria-label', label)
+    btn.innerHTML = mark
+    mount.appendChild(btn)
+    return btn
   }
-  page.appendChild(bar)
+  // Inline strokes rather than glyphs: they inherit `currentColor`, so there is no icon font
+  // to load and nothing that can flash empty on the first frame of a match.
+  const stroke = (body: string) =>
+    `<svg class="hud-tool-icon" viewBox="0 0 20 20" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${body}</svg>`
+  const leaveMark = stroke(
+    '<path d="M12.5 3.5H7a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1h5.5"/><path d="M9.5 10h7m0 0L14 7.5M16.5 10 14 12.5"/>'
+  )
+  const soundOnMark = stroke(
+    '<path d="M4 8.5v3h2.6L10 14.6V5.4L6.6 8.5H4z"/><path d="M12.4 8a3.4 3.4 0 0 1 0 4M14.7 5.8a6.5 6.5 0 0 1 0 8.4"/>'
+  )
+  const soundOffMark = stroke(
+    '<path d="M4 8.5v3h2.6L10 14.6V5.4L6.6 8.5H4z"/><path d="M12.6 8.4l4.2 3.2m0-3.2-4.2 3.2"/>'
+  )
+  const flagMark = stroke('<path d="M5.5 16.5v-13"/><path d="M5.5 4.5h8.5l-1.6 3.1 1.6 3.1h-8.5z"/>')
+  const expandMark = stroke(
+    '<path d="M3.5 7.6V3.5h4.1M16.5 7.6V3.5h-4.1M3.5 12.4v4.1h4.1M16.5 12.4v4.1h-4.1"/>'
+  )
+  const moreMark = stroke(
+    '<circle cx="4.6" cy="10" r="1.35" fill="currentColor" stroke="none"/><circle cx="10" cy="10" r="1.35" fill="currentColor" stroke="none"/><circle cx="15.4" cy="10" r="1.35" fill="currentColor" stroke="none"/>'
+  )
 
-  const spinLabel = el('div', 'spin-label', 'Spin: 0.0 / 0.0')
-  bar.appendChild(spinLabel)
+  const leaveBtn = tool(hud.toolsRoot, 'Leave', leaveMark)
+  leaveBtn.onclick = () => leaveToLobby()
+  // Directly under Leave, in the same column and the same material: the two controls a
+  // player reaches for between shots, and nothing else in that corner.
+  hud.toolsRoot.appendChild(buildCameraToggle())
 
-  // The three session buttons, in one quiet cluster in the corner rather than the
-  // full-width bar they used to be: they are needed occasionally, not per shot.
-  const actions = el('div', 'control-actions')
-  const soundBtn = el('button', 'ghost small', isSoundMuted() ? 'Sound: off' : 'Sound: on')
+  /**
+   * The top-right group: everything that is not leaving.
+   *
+   * Sound, finish, fullscreen and the controls popover. Four round glass buttons on a wide
+   * screen; on a phone they collapse behind one "more" button, which the stylesheet
+   * arranges by hiding the group until `hud-more-open` is on the slot — so the collapse is
+   * layout rather than a second set of buttons to keep in step.
+   */
+  const sessionMount = hud.sessionToolsRoot
+  const moreBtn = el('button', 'hud-tool hud-glass hud-tool--more') as HTMLButtonElement
+  moreBtn.type = 'button'
+  moreBtn.title = 'More controls'
+  moreBtn.setAttribute('aria-label', 'More controls')
+  moreBtn.setAttribute('aria-expanded', 'false')
+  moreBtn.innerHTML = moreMark
+  moreBtn.onclick = () => {
+    const open = sessionMount.classList.toggle('hud-more-open')
+    moreBtn.setAttribute('aria-expanded', String(open))
+  }
+  sessionMount.appendChild(moreBtn)
+
+  const soundBtn = tool(
+    sessionMount,
+    isSoundMuted() ? 'Sound: off' : 'Sound: on',
+    isSoundMuted() ? soundOffMark : soundOnMark
+  )
+  // `aria-pressed` carries the muted state, so the control reads as a toggle rather than as
+  // a button that happens to change its wording.
+  soundBtn.setAttribute('aria-pressed', String(isSoundMuted()))
   soundBtn.onclick = () => {
     const next = !isSoundMuted()
     setSoundMuted(next)
-    soundBtn.textContent = next ? 'Sound: off' : 'Sound: on'
+    soundBtn.innerHTML = next ? soundOffMark : soundOnMark
+    const label = next ? 'Sound: off' : 'Sound: on'
+    soundBtn.title = label
+    soundBtn.setAttribute('aria-label', label)
+    soundBtn.setAttribute('aria-pressed', String(next))
   }
-  const concedeBtn = el('button', 'ghost small', activeMatchIsPractice ? 'Finish' : 'Concede')
+
+  const concedeBtn = tool(sessionMount, activeMatchIsPractice ? 'Finish' : 'Concede', flagMark)
   concedeBtn.onclick = () => {
     if (activeMatchIsPractice) void finishPractice()
     else askConcede()
   }
-  const leaveBtn = el('button', 'ghost small', 'Leave')
-  leaveBtn.onclick = () => leaveToLobby()
-  actions.append(soundBtn, concedeBtn, leaveBtn)
-  bar.appendChild(actions)
+
+  /**
+   * Fullscreen, entered only from this click. The API refuses a request that does not come
+   * from a gesture, so there is nothing to gain by asking earlier and a shot to lose by
+   * interrupting one.
+   */
+  const fullBtn = tool(sessionMount, 'Fullscreen', expandMark)
+  fullBtn.onclick = () => {
+    const leaving = document.fullscreenElement !== null
+    const change = leaving ? document.exitFullscreen() : document.documentElement.requestFullscreen()
+    // A refused request is not worth interrupting a shot over, and the label is corrected
+    // once the transition settles rather than guessed at before it does.
+    change
+      .then(() => {
+        const label = leaving ? 'Fullscreen' : 'Leave fullscreen'
+        fullBtn.title = label
+        fullBtn.setAttribute('aria-label', label)
+      })
+      .catch(() => {})
+  }
+
+  /**
+   * The controls, behind a question mark.
+   *
+   * This line of text used to sit under the table, where it was the widest thing on the
+   * screen and the only element that could push a match past one viewport. It is the same
+   * words, opened on demand, and the sticky dismissal is unchanged: closing it hides the
+   * control for the rest of the session, exactly as the × under the table did.
+   */
+  if (!hintDismissed) {
+    const helpBtn = el('button', 'hud-tool hud-tool--help hud-glass', '?') as HTMLButtonElement
+    helpBtn.type = 'button'
+    helpBtn.title = 'Controls'
+    helpBtn.setAttribute('aria-label', 'Controls')
+    helpBtn.setAttribute('aria-expanded', 'false')
+    const help = el('div', 'hud-pop hud-glass')
+    help.id = 'controls-help'
+    help.setAttribute('role', 'group')
+    help.hidden = true
+    helpBtn.setAttribute('aria-controls', help.id)
+    help.append(
+      el('p', undefined, 'Aim: mouse or touch'),
+      el('p', undefined, 'Power: drag the slider, hold to charge, or ↑/↓ to trim'),
+      el('p', undefined, 'Spin: ↑/↓ side, W/S top-bottom'),
+      el('p', undefined, 'Shoot: release or Space')
+    )
+    const closeHelp = el('button', 'hud-pop-close', '×')
+    closeHelp.title = 'Hide these controls for this session'
+    closeHelp.setAttribute('aria-label', 'Hide the controls hint')
+    closeHelp.onclick = () => {
+      hintDismissed = true
+      helpBtn.remove()
+      help.remove()
+    }
+    help.appendChild(closeHelp)
+    helpBtn.onclick = () => {
+      help.hidden = !help.hidden
+      helpBtn.setAttribute('aria-expanded', String(!help.hidden))
+    }
+    sessionMount.append(helpBtn, help)
+  }
+
+  // The spin readout goes with the dial it describes: the number was the last item in the
+  // bar under the table, and the dial is the control it belongs to. The pointer maths reads
+  // the ball's own rect and the caption takes no pointer events, so the drag is unchanged.
+  const spinLabel = el('div', 'spin-label', 'Spin: 0.0 / 0.0')
+  hud.spinDialRoot.appendChild(spinLabel)
 
   app.appendChild(page)
+  // The stage is a fixed, inset-0 box, so its content box is the viewport and this
+  // observer fires for a window resize and for an orientation change both — including
+  // the rotation that changes the shape of the screen from portrait to landscape and so
+  // changes the camera's aspect with it.
   applyCanvasSize()
   gameResizeObserver?.disconnect()
   gameResizeObserver = new ResizeObserver(() => applyCanvasSize())
   gameResizeObserver.observe(stage)
-  dprCap = 1.5
+  dprCeiling = dprCeilingForScreen()
+  dprCap = dprCeiling
   frameEma = 0
   slowFrames = 0
 
   scene3d?.dispose()
-  scene3d = Scene3D.create(canvas, canvas.width, canvas.height)
+  const buildOpts = pendingSceneBuildProgress
+    ? { onBuildProgress: pendingSceneBuildProgress }
+    : undefined
+  pendingSceneBuildProgress = undefined
+  scene3d = Scene3D.create(canvas, canvas.width, canvas.height, buildOpts)
+
+  // A new scene has no camera move in it and is not holding the overhead placement view,
+  // so a placement that was mid-flight against the old one would be describing a camera
+  // that no longer exists: waiting for a flight home that the new scene will never start,
+  // or picking a ghost through a camera that is sitting at the gameplay view. The flow is
+  // reset to nothing and the next snapshot drives it again from the top, which is the only
+  // honest starting point.
+  placementFlow = initialPlacementFlow()
+  placementTarget = null
+  placementLegal = false
+  placementPendingCommit = null
+  placementCommitInFlight = false
+  // Nothing is waiting on a resume from the old scene. The server's hold for it is left
+  // to its own backstop, which is the only thing that can end a hold whose client is gone.
+  placementResumePending = false
+  // The declaration is per-placement too. A hold left standing on the old scene would
+  // be held against a flow that no longer exists, so the next placement declares itself
+  // again from the top.
+  placementDeclared = false
 
   updateHud()
   updateOpponentGone()
@@ -1713,7 +2634,7 @@ function renderGame(): void {
     // The 3D scene answers pointer questions by casting through the camera it is drawing
     // with, so the aim means the same thing from behind the cue ball as from overhead. Asked
     // for per gesture rather than captured once, because the camera is still easing towards
-    // its next position while the player is aiming ΓÇö and because a graphics error can take
+    // its next position while the player is aiming — and because a graphics error can take
     // the 3D scene away mid-game, leaving the flat renderer to answer instead.
     view: () =>
       scene3d
@@ -1724,16 +2645,21 @@ function renderGame(): void {
           }
         : undefined,
     // The only gesture that turns the camera between shots: a deliberate right- or
-    // middle-button drag. Hovering the pointer over the table never rotates anything ΓÇö
+    // middle-button drag. Hovering the pointer over the table never rotates anything —
     // it aims the cue, and the camera stands exactly where the last shot left it.
     onOrbit: (pixels) => scene3d?.orbitBy(pixels * CAMERA_ORBIT_PER_PIXEL),
     // The visit is only playable when the table has settled, which is the same
     // condition that draws the cue. Firing while a shot is still animating used to
     // be accepted by the server and cut the animation dead.
-    enabled: () => isVisitPlayable(),
+    enabled: () => {
+      // Input stays refused for the whole of a placement camera move, in either
+      // direction. Without this a player could aim mid-flight, and the aim's heading
+      // would arrive as the transition lands and yank the camera off its end pose.
+      return isInputAllowed()
+    },
     onChange: (aim) => {
       hud?.setPower(aim.power)
-      // The dial mirrors whatever wrote the spin ΓÇö arrows, its own drag, a reset ΓÇö
+      // The dial mirrors whatever wrote the spin — arrows, its own drag, a reset —
       // because both controls are views of this one pair of numbers.
       hud?.setSpin({ x: aim.spinX, y: aim.spinY })
       spinLabel.textContent = `Spin: ${aim.spinX.toFixed(1)} / ${aim.spinY.toFixed(1)}`
@@ -1791,7 +2717,7 @@ interface GameUpdatePayload {
  * counting on a view of a turn that is over. It is deliberately tolerant of a missing
  * field: a message with no timing attached means no clock, not a crash.
  *
- * Messages are also guarded against arriving out of order â€” a queued `frame:start`
+ * Messages are also guarded against arriving out of order — a queued `frame:start`
  * landing after a fresher `turn:clock` would otherwise rewind a clock that had already
  * been set. The server's own send time is the arbiter: an older message says nothing
  * about the clock that a newer one has not already said.
@@ -1838,7 +2764,7 @@ function isVisitPlayable(): boolean {
  *
  * A fresh visit starts with no spin applied, exactly as it starts with an empty
  * power bar: leftover english from a previous shot is a value the player is no
- * longer setting, and the one place it would still be visible ΓÇö the dial's dot ΓÇö
+ * longer setting, and the one place it would still be visible — the dial's dot —
  * would be lying about what the next shot will do. Fired wherever the visit's
  * power is reset, so both between-shot controls move together.
  */
@@ -1892,7 +2818,7 @@ function applyGameUpdate(data: GameUpdatePayload): void {
   // The clock is read here, alongside the score and the turn. A message carrying a
   // shot is the moment the timer freezes: the balls are moving, so no turn is being
   // timed, and the ring holds where it was rather than counting through an animation.
-  // Any other table message adopts the timing it carries â€” a fresh 30 when the table
+  // Any other table message adopts the timing it carries — a fresh 30 when the table
   // has settled on the same visit or a new one, nothing when the server has stopped
   // the clock outright.
   if (data.playback) shotTimer.freeze()
@@ -1946,8 +2872,8 @@ function applyGameUpdate(data: GameUpdatePayload): void {
       const d = ev.data as { winnerSeat: number }
       const show = (): void => {
         // The frames score moves with the verdict, not with the snapshot. It is the
-        // loudest spoiler in the game ΓÇö a frame won is a frame won, and there is no
-        // reading of an updated frame tally that is not the answer ΓÇö so it waits with
+        // loudest spoiler in the game — a frame won is a frame won, and there is no
+        // reading of an updated frame tally that is not the answer — so it waits with
         // the bell and the announcement. The HUD picks it up on the refresh that ends
         // the replay.
         framesWon = d.winnerSeat === 0 ? [framesWon[0] + 1, framesWon[1]] : [framesWon[0], framesWon[1] + 1]
@@ -2050,8 +2976,8 @@ function handleSocketEvents(socket: Socket): void {
   })
   socket.on('game:update', (data: GameUpdatePayload) => handleGameUpdate(data))
   // The clock's own channel. The room also changes its clock between table broadcasts
-  // â€” a fresh turn the moment a replay is released, a stop when the striker goes away
-  // â€” and those moments carry no frame of their own, so they are announced here and
+  // — a fresh turn the moment a replay is released, a stop when the striker goes away
+  // — and those moments carry no frame of their own, so they are announced here and
   // adopted like any other timing.
   socket.on('turn:clock', (data: { turn?: TurnTiming }) => {
     applyTurnTiming(data.turn ?? null)
@@ -2072,7 +2998,7 @@ function handleSocketEvents(socket: Socket): void {
     if (data.seat === mySeat) return
     opponentGone = true
     updateOpponentGone()
-    toast('Opponent disconnected â€” waiting for reconnect')
+    toast('Opponent disconnected — waiting for reconnect')
   })
   socket.on('opponent:reconnected', (data: { seat: number }) => {
     if (data.seat === mySeat) return
@@ -2084,14 +3010,14 @@ function handleSocketEvents(socket: Socket): void {
     'match:replay',
     (data: { events: Array<{ seq: number; type: string; data: unknown }> }) => {
       if (!data.events.length) return
-      toast(`Reconnected â€” missed ${data.events.length} event${data.events.length === 1 ? '' : 's'}`)
+      toast(`Reconnected — missed ${data.events.length} event${data.events.length === 1 ? '' : 's'}`)
       for (const ev of data.events) {
         if (ev.type === 'BALL_POTTED') {
           const d = ev.data as { ballId: number }
           toast(`Missed: potted ${ballName(d.ballId)}`)
         } else if (ev.type === 'FOUL') {
           const d = ev.data as { penalty: number; reason?: string }
-          toast(d.reason ? `Missed: foul â€” ${d.reason} (-${d.penalty})` : `Missed: foul (-${d.penalty})`, 'error')
+          toast(d.reason ? `Missed: foul — ${d.reason} (-${d.penalty})` : `Missed: foul (-${d.penalty})`, 'error')
         } else if (ev.type === 'FRAME_END') {
           const d = ev.data as { winnerSeat: number }
           toast(`Missed: frame won by ${seatName(d.winnerSeat)}`)
@@ -2099,19 +3025,43 @@ function handleSocketEvents(socket: Socket): void {
       }
     }
   )
-  socket.on('error', (data: { code?: string }) => toast(`Server: ${data.code ?? 'unknown error'}`, 'error'))
+  socket.on('error', (data: { code?: string }) => {
+    // A refusal while a placement commit is in flight is the server rejecting the spot.
+    // The snapshot then still says the cue ball is in hand, which looks exactly like a
+    // commit that is merely slow, so nothing downstream would ever notice the refusal and
+    // the flow would sit in `RETURNING` waiting for an acknowledgement that is not coming -
+    // leaving the player at a gameplay view with dead controls and a cue ball they still
+    // own. Handing the placement back is what turns that dead end into a retry.
+    if (placementCommitInFlight) {
+      const recovered = rejectPlacement(placementFlow)
+      if (recovered !== placementFlow) {
+        placementFlow = recovered
+        placementCommitInFlight = false
+        // Nothing was put down, so there is no flight to finish and no resume owed. The
+        // server is still holding the clock for this placement, which is what it should
+        // do: the player is about to try again, and the retry is still part of placing.
+        placementResumePending = false
+        placementTarget = null
+        placementLegal = false
+        // The camera is halfway back down to the gameplay view. It has to turn around:
+        // finishing that flight would land the player at a view they are not allowed to use.
+        scene3d?.beginPlacementCamera(PLACEMENT_CAMERA_SECONDS)
+      }
+    }
+    toast(`Server: ${data.code ?? 'unknown error'}`, 'error')
+  })
   socket.on('notification:new', (n: NotificationItem) => {
     notifications.unshift(n)
     if (panelOpen) panelEl?.classList.remove('open')
-    toast(`${n.title}${n.body && n.body !== n.title ? ' â€” ' + n.body : ''}`)
+    toast(`${n.title}${n.body && n.body !== n.title ? ' — ' + n.body : ''}`)
     refreshBell()
   })
 }
 
 /**
  * Whether this client is mid-placement: my visit, the cue ball in hand, and the
- * table settled. The frame's `cueInHandInD` says which restriction is in force ΓÇö
- * the D only at break-off, anywhere mid-frame ΓÇö and the whole presentation flow
+ * table settled. The frame's `cueInHandInD` says which restriction is in force —
+ * the D only at break-off, anywhere mid-frame — and the whole presentation flow
  * (camera, D overlay, ghost) keys off this one question.
  */
 function isPlacing(): boolean {
@@ -2119,44 +3069,93 @@ function isPlacing(): boolean {
 }
 
 /**
- * Runs the ball-in-hand placement experience for one frame: the D-only or
- * whole-table indication, the ghost cue ball and the click-to-place commit.
+ * Tells the server that a placement is under way, so the strike clock is held for it.
  *
- * The camera is deliberately NOT touched here. Placement happens in whatever
- * 3D perspective view the player is in ΓÇö orbit and look-around stay live, and
- * the view toggle remains theirs alone to press. The ghost cue ball and the
- * ghost's legality tint carry the placement in the perspective view, which is
- * what keeps the scene from snapping into a flat overhead card on every foul.
+ * Once per placement, not once per frame. `stepPlacement` runs every animation frame and
+ * re-enters `ENTERING` only on the frame the phase changes, but the declaration has to
+ * be safe against the other ways in: the confirm path calls it too, so that a
+ * confirmation cannot leave the clock running for the flight home. The server treats a
+ * repeated `placement:begin` as a no-op rather than re-holding the clock, so a duplicate
+ * here costs a message and nothing else.
+ *
+ * Nothing here changes the flow or the camera. This is a message about time, not about
+ * rules: the server holds the clock for a declared placement and releases it when the
+ * ball is down or when its own backstop expires, whichever comes first.
+ */
+function declarePlacement(): void {
+  if (placementDeclared || !activeMatchId) return
+  placementDeclared = true
+  getSocket().emit('placement:begin', { matchId: activeMatchId })
+}
+
+/**
+ * Runs the ball-in-hand placement experience for one frame.
+ *
+ * The camera, the overlays and the ghost are all driven off one phase, from
+ * `stepPlacementFlow`: entering, placing, returning. The camera flies up to the overhead
+ * view on `ENTERING`, the ghost is only live on `PLACING`, and the flight back to the
+ * gameplay view happens on `RETURNING` with the cue ball already locked at the confirmed
+ * spot. Input is refused in every phase but `PLACING`, which is what stops the player
+ * fighting a camera that is still moving.
+ *
+ * Nothing here decides a rule: the D restriction comes from the snapshot's
+ * `cueInHandInD`, and the legality of any given spot comes from `placementStatus`, which
+ * mirrors the server's own test. The server still rejects an illegal placement
+ * authoritatively.
  */
 function stepPlacement(canvas: HTMLCanvasElement): void {
   const placing = isPlacing()
   const inD = frame?.cueInHandInD === true
+  const cameraSettled = scene3d?.isPlacementCameraSettled() ?? true
+  // The server has taken the placement once the snapshot stops saying the cue ball is in
+  // hand. Nothing else clears it, so a rejected spot cannot be mistaken for a placed one.
+  const serverAccepted = !frame?.cueInHand
 
-  if (placing && !placementWasActive) {
-    // Entering placement: overlays on, in the current view. A placement already
-    // sent (a fast double-click, say) is not forgotten; the in-flight flag is
-    // only cleared by the server showing the ball placed.
-    placementTarget = null
+  const previousPhase = placementFlow.phase
+  placementFlow = stepPlacementFlow(placementFlow, { placing, cameraSettled, serverAccepted })
+
+  // The camera is moved exactly once per transition, keyed on the phase having just
+  // changed into it. Keying on the phase rather than on a frame-by-frame condition is
+  // what stops a move being restarted every frame while it is already running.
+  if (placementFlow.phase !== previousPhase) {
+    if (placementFlow.phase === 'ENTERING') {
+      // A fresh placement: nothing is confirmed, the overlays go up, and the camera
+      // starts its flight to the overhead view. The D overlay follows `cueInHandInD`,
+      // so this is the break-off case and only the D is shaded.
+      placementTarget = null
+      placementLegal = false
+      placementPendingCommit = null
+      placementCommitInFlight = false
+      scene3d?.setPlacementMode(true, inD)
+      scene3d?.beginPlacementCamera(PLACEMENT_CAMERA_SECONDS)
+      // Declared as the placement starts rather than when it is confirmed, because the
+      // flight to the overhead view is part of placing and not part of aiming. The
+      // player should not spend strike-clock seconds watching a camera move.
+      declarePlacement()
+    } else if (placementFlow.phase === 'RETURNING') {
+      // The flight home happens on `RETURNING` whether the placement was confirmed or
+      // withdrawn. Gating this on `confirmed` left the camera stranded overhead when a
+      // placement was pulled out from under it mid-flight: nothing was sent to the
+      // server, the flow went to `RETURNING`, and with no camera move started the view
+      // never came back down.
+placementTarget = null
     placementLegal = false
     placementPendingCommit = null
-    scene3d?.setPlacementMode(!placementCommitInFlight, inD)
-  } else if (placing && placementWasActive) {
-    // Staying in placement: the D flag can change between frames (a snapshot
-    // arriving late), so the overlays follow it live.
-    if (!placementCommitInFlight) scene3d?.setPlacementMode(true, inD)
-  } else if (!placing && placementWasActive) {
-    // Placement over: the cue ball is down (or the visit moved on).
     scene3d?.setPlacementMode(false, false)
-    placementTarget = null
-    placementPendingCommit = null
-    placementCommitInFlight = false
+    hintPlacement(null)
+    scene3d?.endPlacementCamera(placementFlow.confirmed, undefined, PLACEMENT_CAMERA_SECONDS)
+    }
   }
-  placementWasActive = placing && !placementCommitInFlight
 
-  if (placing && !placementCommitInFlight) {
-    // Track the pointer as the ghost's target. The pointer position is read
-    // through the live camera each frame, so the view easing toward overhead
-    // does not freeze the ghost at a stale spot.
+  // The ghost is live only in `PLACING`, and the D flag can change between frames (a
+  // snapshot arriving late), so the overlays follow it live rather than being latched
+  // when the placement began. `cueInHandInD` is true only at break-off, so this is the
+  // one place the D is shaded; a mid-frame in-hand leaves the whole table unshaded.
+  if (placementAllowsGhostInput(placementFlow)) {
+    scene3d?.setPlacementMode(true, inD)
+    // Track the pointer as the ghost's target. The pointer position is read through the
+    // live camera each frame, so the camera easing overhead does not freeze the ghost at
+    // a stale spot.
     if (lastPointerCanvas) {
       const rect = canvas.getBoundingClientRect()
       const px = ((lastPointerCanvas.clientX - rect.left) / rect.width) * canvas.width
@@ -2174,7 +3173,7 @@ function stepPlacement(canvas: HTMLCanvasElement): void {
               : status.reason === 'in-pocket'
                 ? 'Too close to a pocket'
                 : status.reason === 'crowded'
-                  ? 'Not enough room ΓÇö a ball is in the way'
+                  ? 'Not enough room — a ball is in the way'
                   : 'Place the cue on the table'
           hintPlacement(label)
         } else {
@@ -2187,24 +3186,79 @@ function stepPlacement(canvas: HTMLCanvasElement): void {
     }
   }
 
-  // A click that was accepted fires the placement stroke exactly once. The shot
-  // carries `cuePos`, which is all the server needs to put the ball down and let
-  // the frame continue; everything else is the same shape a real shot has.
+  // A click that was accepted fires the placement exactly once. It goes out as a
+  // `placement:confirm` carrying only the spot, and never as a shot: this used to be
+  // sent as a zero-power `shot:play` with a `cuePos`, which the server could not tell
+  // apart from a striker who had swung at nothing, so it placed the ball and then ruled
+  // on the empty stroke - a foul, four points against, and the visit handed to the
+  // opponent. Confirming moves the flow to `RETURNING`, which starts the camera's
+  // flight home.
   if (placementPendingCommit && placementLegal && !placementCommitInFlight && activeMatchId) {
     const pos = placementPendingCommit
+    const confirmed = confirmPlacement(placementFlow, pos)
     placementPendingCommit = null
-    placementCommitInFlight = true
+    if (confirmed === placementFlow) {
+      // Not in `PLACING`, so the click arrived while a camera move was in flight and is
+      // discarded rather than starting a second placement on top of the one running.
+      placementLegal = false
+    } else {
+      placementFlow = confirmed
+      placementCommitInFlight = true
+      scene3d?.setPlacementMode(false, false)
+      hintPlacement(null)
+      // The confirmed spot is handed to the camera rather than left for it to work out:
+      // the snapshot that carries the placed cue ball has not arrived yet, so resolving it
+      // there would aim the flight home at wherever the ball used to be.
+      scene3d?.endPlacementCamera(confirmed.confirmed, undefined, PLACEMENT_CAMERA_SECONDS)
+      // Declared before confirming, so the clock is already held if the confirmation is
+      // slow or is lost and has to be retried. Ordering it the other way round would
+      // leave a window where the ball is down and the server is still counting.
+      declarePlacement()
+      getSocket().emit('placement:confirm', { matchId: activeMatchId, cuePos: { x: pos.x, y: pos.y } })
+      // The clock stays held from here until the camera is home. This is the flag that
+      // sends the release when that happens.
+      placementResumePending = true
+      toast('Cue ball placed', 'info')
+    }
+  }
+
+  // Back to idle: the camera has landed at the gameplay view and the server has taken the
+  // placement, so this player's controls are theirs again.
+  if (placementIsOver(placementFlow)) {
     scene3d?.setPlacementMode(false, false)
-    const shot = placementShot(pos, placementAimAngle(pos), cueController?.aim.power ?? 0)
-    getSocket().emit('shot:play', { matchId: activeMatchId, input: { ...shot, timestamp: Date.now() } })
-    toast('Cue ball placed', 'info')
-    hintPlacement(null)
-  }
-  // If the commit was lost ΓÇö the server rejected the spot, say ΓÇö the snapshot
-  // still says cueInHand and the placement state machine starts over cleanly.
-  if (placementCommitInFlight && frame?.cueInHand && isVisitPlayable() && !shotInFlight) {
+    placementTarget = null
+    placementPendingCommit = null
     placementCommitInFlight = false
+    // The ball is down and the camera is home, which is the point at which the player can
+    // actually shoot - so this is where the clock starts again. The server has been holding
+    // it since the placement began and resumes it from the time that was left then, so
+    // nothing the player spent on the camera or on hunting for a spot is charged to them.
+    if (placementResumePending && activeMatchId) {
+      placementResumePending = false
+      getSocket().emit('placement:done', { matchId: activeMatchId })
+    }
+    // The next placement has to declare itself again. The hold was released once the ball
+    // went down and the camera landed, so leaving this set would leave the next
+    // placement's clock running while the player hunted for a spot.
+    placementDeclared = false
   }
+}
+
+/**
+ * Whether the player may aim, fire or charge power right now.
+ *
+ * Three answers have to agree before the controls come back. `isVisitPlayable` is this
+ * client's own: whose turn it is, and whether the table has settled. `placementAllowsGameplayInput`
+ * is the flow's, and the scene's `isPlacementTransitionBlocking` is the camera's. Dropping
+ * the first of those let the controls come back during a replay or on the opponent's turn,
+ * because the placement flow is perfectly happy to be `IDLE` the whole time.
+ */
+function isInputAllowed(): boolean {
+  return (
+    isVisitPlayable() &&
+    placementAllowsGameplayInput(placementFlow) &&
+    !(scene3d?.isPlacementTransitionBlocking() ?? false)
+  )
 }
 
 /**
@@ -2240,9 +3294,11 @@ function loop(): void {
           applyCanvasSize()
           toast('Lowered graphics quality for smoother play', 'info')
         }
-        if (frameEma < 14 && dprCap < 1.5 && now - lastDprUpAt > 20000) {
+        // Back up to the ceiling for this screen, which is 2 on a desktop and 1.5 on a
+        // phone: the ladder restores the sharpness the device can take, and never more.
+        if (frameEma < 14 && dprCap < dprCeiling && now - lastDprUpAt > 20000) {
           lastDprUpAt = now
-          dprCap = 1.5
+          dprCap = dprCeiling
           applyCanvasSize()
         }
       }
@@ -2259,7 +3315,11 @@ function loop(): void {
       // aim guide were drawn while the balls were still moving. The power slider is
       // enabled by exactly the same condition: it is this player's visit and the
       // balls have stopped.
-      const canAim = isVisitPlayable()
+      //
+      // `isInputAllowed` folds in the placement flow as well, so the cue stick, the aim
+      // guide and the power bar all come back on the same frame — and stay away on every
+      // frame of a placement camera move.
+      const canAim = isInputAllowed()
       hud?.setPowerEnabled(canAim)
       const renderOptions = {
         aim: cueController?.aim,
@@ -2272,7 +3332,14 @@ function loop(): void {
         // the view for as long as it lasts, then hands it back.
         scene3d.setCameraMode(cameraMode)
         scene3d.setTracking(shotPlayer !== null)
-        if (cameraToggleEl) cameraToggleEl.hidden = false
+        if (cameraToggleEl) {
+          cameraToggleEl.hidden = false
+          // The toggle is one of the player's normal controls, so it goes away with the
+          // rest of them during a placement. The scene already ignores the mode while the
+          // placement view is up, but a button that still reads as live and changes its
+          // own label while doing nothing is worse than one that is plainly unavailable.
+          cameraToggleEl.disabled = !canAim
+        }
         scene3d.update(shown, renderOptions)
         scene3d.render()
       } else {
@@ -2286,7 +3353,7 @@ function loop(): void {
     if (scene3d) {
       scene3d?.dispose()
       scene3d = null
-      toast('Graphics error â€” switched to fallback renderer', 'error')
+      toast('Graphics error — switched to fallback renderer', 'error')
     }
     reportFatalError(error)
   }
@@ -2395,7 +3462,7 @@ function renderMaintenance(): void {
   el.className = isAdmin ? 'maintenance-banner' : 'maintenance-overlay'
   const p = document.createElement('p')
   p.textContent = isAdmin
-    ? 'Maintenance mode is ON â€” players are blocked. Turn it off in Admin â†’ Settings.'
+    ? 'Maintenance mode is ON - players are blocked. Turn it off in Admin -> Settings.'
     : 'The platform is briefly under maintenance. Please check back soon.'
   el.appendChild(p)
   document.body.appendChild(el)

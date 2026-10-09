@@ -25,11 +25,11 @@ const HALF_W = TABLE_WIDTH / 2
  * ------------------------------------------------------------------ */
 
 /** Vertical field of view for the aim camera, in degrees. */
-export const AIM_FOV_DEG = 50
+export const AIM_FOV_DEG = 55
 /** How far behind the cue ball the aim camera sits, in millimetres. */
-export const AIM_BACK_MM = 800
+export const AIM_BACK_MM = 540
 /** How far above the cloth the aim camera sits, in millimetres. */
-export const AIM_HEIGHT_MM = 350
+export const AIM_HEIGHT_MM = 320
 /**
  * How far ahead of the cue ball the aim camera looks, in millimetres.
  *
@@ -37,19 +37,49 @@ export const AIM_HEIGHT_MM = 350
  * itself puts the horizon above the shot line, so the table runs away toward the top of
  * the screen and the cue ball sits low and near, the way a cue view actually looks.
  */
-export const AIM_LOOK_AHEAD_MM = 700
+export const AIM_LOOK_AHEAD_MM = 950
 /** The height the aim camera looks at: the cloth, not the ball. */
 export const AIM_LOOK_HEIGHT_MM = 0
 
+/**
+ * The height the aim camera keeps whenever it is pushed back over the rail, in millimetres.
+ *
+ * The aim height already clears everything on the table by a wide margin, so this floor is
+ * a guard rather than a constraint the modes feel: it holds if the height is ever tuned
+ * down, so a cue ball frozen on a cushion can never put the lens inside the frame. Only
+ * the lens is raised; the look target is never touched.
+ */
+export const AIM_RAIL_CLEARANCE_MM = 200
+
+/**
+ * The aspect ratio below which the aim camera starts widening for a narrow portrait screen.
+ *
+ * A landscape frame holds the whole shot line with the base FOV; a phone held upright does
+ * not, and the widening is what keeps the far cushion and the shot line framed when the
+ * canvas is tall rather than wide.
+ */
+export const AIM_PORTRAIT_FROM_ASPECT = 1
+/** Extra degrees of vertical FOV per unit of aspect below the portrait threshold. */
+export const AIM_PORTRAIT_FOV_PER_ASPECT = 14
+/** The most the portrait widening can ever add, in degrees. */
+export const AIM_PORTRAIT_MAX_EXTRA_DEG = 12
+
+/** The aim camera's vertical FOV for a canvas shape, widened on narrow portrait screens. */
+export function aimFovDeg(aspect: number): number {
+  const narrow = Math.max(0, AIM_PORTRAIT_FROM_ASPECT - aspect)
+  return AIM_FOV_DEG + Math.min(AIM_PORTRAIT_MAX_EXTRA_DEG, narrow * AIM_PORTRAIT_FOV_PER_ASPECT)
+}
+
 /** Vertical field of view for the overhead camera, in degrees. */
-export const TOP_DOWN_FOV_DEG = 50
+export const TOP_DOWN_FOV_DEG = 48
 /**
  * Extra room around the table for the overhead camera, as a multiple of the half-extent.
  *
  * Covers the cushions and the pocket jaws, which sit outside the cloth, so that the
  * overhead view is of the whole table and not of the bed with its edges shaved off.
+ * Kept tight so balls read larger in top-down without changing physics scale.
  */
-export const TOP_DOWN_MARGIN = 1.1
+export const TOP_DOWN_MARGIN = 1.03
 /** A floor under the overhead height, so it never drops onto the cloth on a wide canvas. */
 export const TOP_DOWN_MIN_HEIGHT_MM = 1500
 
@@ -122,12 +152,18 @@ export const MAX_CAMERA_HEIGHT_MM = 6000
 /**
  * The furthest from the table's centre the lens may sit, in millimetres.
  *
- * Has to clear the aim camera's 800mm setback when the cue ball is in a corner and the
- * shot is played back down the table — 2600mm from centre at worst — and the tracking
+ * 4600 is the radius of the venue's own camera landing: the ring of bare carpet the
+ * television tripods stand on, which runs from the hoardings at 4300 out to the front of
+ * the first row of seats at 4740. Every view may therefore stand where a real broadcast
+ * camera would — on that landing, or anywhere inboard of it — and none may reach the
+ * seating, which is the only place in the bowl a camera would visibly bury itself.
+ *
+ * It still clears the aim camera's 540mm setback when the cue ball is in a corner and the
+ * shot is played back down the table — 2140mm from centre at worst — and the tracking
  * camera's 950mm from a focus at the far rail, with room over both. It is a backstop
  * against a bad pose, not a constraint the modes feel.
  */
-export const CAMERA_REACH_MM = 3000
+export const CAMERA_REACH_MM = 4600
 /** The narrowest and widest the lens may ever be, in degrees. */
 export const MIN_FOV_DEG = 30
 export const MAX_FOV_DEG = 75
@@ -136,11 +172,39 @@ export const MAX_FOV_DEG = 75
  * How much of the table the overhead camera has to show: the cloth, the cushions, and
  * the pocket mouths, which all reach past the cushion line.
  */
-export const VISIBLE_HALF_LENGTH = HALF_L + POCKET_RADIUS_CORNER + 60
-export const VISIBLE_HALF_WIDTH = HALF_W + POCKET_RADIUS_CORNER + 60
+export const VISIBLE_HALF_LENGTH = HALF_L + POCKET_RADIUS_CORNER + 45
+export const VISIBLE_HALF_WIDTH = HALF_W + POCKET_RADIUS_CORNER + 45
 
-/** The three things the camera can be doing. */
-export type CameraMode = 'AIM' | 'TOP_DOWN' | 'TRACK'
+/**
+ * The things the camera can be doing.
+ *
+ * `PLACEMENT_TOP_DOWN` is the overhead view the cue-ball placement flow flies to and holds
+ * while the player places the ball. Being in the middle of flying there or back is not a
+ * mode at all: a placement move interpolates the rig's pose directly rather than damping
+ * towards a target, so the flight owns the pose outright and no mode is being served while
+ * it runs. That is what stops a placement cutting to a different camera and back again -
+ * there is only ever the one rig and one pose.
+ */
+export type CameraMode = 'AIM' | 'TOP_DOWN' | 'TRACK' | 'PLACEMENT_TOP_DOWN' | 'BROADCAST' | 'SIDE' | 'CLOSE'
+
+/**
+ * The views the player may choose between, in the order the toggle walks them.
+ *
+ * `AIM` is the cue-ball camera the game plays in and `TOP_DOWN` is the overhead one, and
+ * the three between them are the venue's own broadcast cameras: a wide shot down the
+ * table, a side-on table camera, and a close camera that stays with the cue ball. A shot
+ * takes the camera away from all of them for as long as it lasts and hands it back, so
+ * the order only matters while the player is free to aim.
+ */
+export type PlayerCameraMode = 'AIM' | 'BROADCAST' | 'SIDE' | 'CLOSE' | 'TOP_DOWN'
+
+export const PLAYER_CAMERA_MODES: readonly PlayerCameraMode[] = [
+  'AIM',
+  'BROADCAST',
+  'SIDE',
+  'CLOSE',
+  'TOP_DOWN'
+]
 
 /** Where the camera is, and where it is looking, all in table millimetres. */
 export interface CameraPose {
@@ -166,14 +230,14 @@ export const MAX_ORBIT_RAD = Math.PI
  * Where the camera is pointed, kept apart from where the cue is pointed.
  *
  * These are two different questions and the rig is not allowed to answer one with the
- * other. Aiming sweeps the cue the whole length of the table, and a camera bolted to that
- * angle swings round behind the cue ball with it, so sweeping out a shot line turns the
- * room over rather than turning the cue. The heading is therefore latched when a shot
- * starts and held for as long as the player spends on that shot, and the player's own
- * look-around is kept as a separate offset that only a deliberate drag can move.
+ * other. The heading follows the live aim while the player is free to aim — gated to
+ * the half-plane in front of the lens, so the drag-back that sets power cannot spin the
+ * camera — and is latched for the length of a played shot, so watching the balls move
+ * does not turn the room over. The player's own look-around is a separate offset that
+ * only a deliberate drag can move, and it rides on top of whichever heading is current.
  */
 export interface HeadingLatch {
-  /** The heading the camera was last pointed at. Fixed for the length of a shot. */
+  /** The heading the camera was last pointed at. Follows the aim, or latched for a shot. */
   heading: number
   /** The player's look-around from the current heading. Right-drag only. */
   orbit: number
@@ -186,14 +250,10 @@ export function initialHeadingLatch(aimAngle: number = 0): HeadingLatch {
 /**
  * Carries the latch from one frame to the next.
  *
- * `startingShot` is the signal that a new shot is being set up. While it is false nothing
- * about the aim can reach the camera, which is what keeps a moving cursor from turning
- * anything: however far the player's aim travels in between, the heading and the orbit
- * come back out of here untouched.
- *
- * A new shot re-latches from the aim it starts with and drops the look-around, because
- * that aim is the direction the player just played, so the camera comes back to the view
- * the shot was taken from rather than to wherever they had wandered.
+ * `startingShot` is the signal that a shot is going out: the heading is latched to the
+ * aim it is being played along and the look-around is dropped, and for as long as the
+ * shot lasts nothing about a moving pointer can reach the camera. Between shots the
+ * heading is owned by {@link followHeadingLatch} instead, which chases the live aim.
  */
 export function stepHeadingLatch(
   latch: HeadingLatch,
@@ -212,6 +272,26 @@ export function addOrbit(latch: HeadingLatch, delta: number): HeadingLatch {
 /** The heading the camera is actually pointed along: the latched one, plus the look-around. */
 export function latchedCameraYaw(latch: HeadingLatch): number {
   return latch.heading + latch.orbit
+}
+
+/** The furthest the aim may turn from the camera's heading before the camera stops following it, in radians. */
+export const AIM_FOLLOW_MAX_DELTA_RAD = Math.PI / 2
+
+/**
+ * Follows the live aim with the camera's heading, while the aim camera is the view.
+ *
+ * The heading chases the aim so the lens stays directly behind the cue ball on the shot
+ * line, and the rig's own easing is what makes the chase feel damped rather than snapped.
+ * The gate is a half-plane: an aim more than a quarter turn from where the lens is
+ * pointed is not a turn but the pick landing behind the ball — the drag-back that sets
+ * power — and chasing that would spin the camera round and round, so the camera holds
+ * until the aim comes back in front of it.
+ */
+export function followHeadingLatch(latch: HeadingLatch, aimAngle: number): HeadingLatch {
+  if (Math.abs(shortestAngleDelta(latchedCameraYaw(latch), aimAngle)) > AIM_FOLLOW_MAX_DELTA_RAD) {
+    return latch
+  }
+  return { heading: aimAngle, orbit: latch.orbit }
 }
 
 /** What the rig is being asked to do this frame. */
@@ -315,9 +395,11 @@ export function topDownHeight(aspect: number, fovDeg: number = TOP_DOWN_FOV_DEG)
 /**
  * The aim camera's pose for a cue ball and a heading.
  *
- * Placed along the line behind the cue ball, so the cue ball is dead centre of the frame
- * and the shot line runs away from the viewer, which is the view that makes the object
- * ball the far thing rather than the near one.
+ * Placed along the line behind the cue ball, so the cue ball is low and centred of the
+ * frame and the shot line runs away from the viewer up the middle of the screen, which
+ * is the view that makes the object ball the far thing rather than the near one. When
+ * the cue ball is close enough to a cushion to push the lens out over the rail, the
+ * height is floored at the rail clearance rather than the shot being pulled in.
  */
 export function aimPose(
   cue: { x: number; y: number },
@@ -326,10 +408,13 @@ export function aimPose(
 ): CameraPose {
   const dx = Math.cos(yaw)
   const dy = Math.sin(yaw)
+  const x = cue.x - dx * AIM_BACK_MM
+  const y = cue.y - dy * AIM_BACK_MM
+  const overRail = x < 0 || x > TABLE_LENGTH || y < 0 || y > TABLE_WIDTH
   return {
-    x: cue.x - dx * AIM_BACK_MM,
-    y: cue.y - dy * AIM_BACK_MM,
-    height: AIM_HEIGHT_MM,
+    x,
+    y,
+    height: overRail ? Math.max(AIM_HEIGHT_MM, AIM_RAIL_CLEARANCE_MM) : AIM_HEIGHT_MM,
     lookX: cue.x + dx * AIM_LOOK_AHEAD_MM,
     lookY: cue.y + dy * AIM_LOOK_AHEAD_MM,
     lookHeight: AIM_LOOK_HEIGHT_MM,
@@ -377,6 +462,147 @@ export function trackPose(focus: { x: number; y: number; spread: number }, yaw: 
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * The venue's three television cameras.
+ *
+ * A broadcast camera is bolted to a position and does not follow the balls, so these are
+ * fixed poses rather than solved ones — with one exception: the close camera stays with
+ * the cue ball, because that is where the player is.
+ *
+ * Each is placed from the geometry of the room it stands in. The wide shot sits on the
+ * camera landing 4500mm out along the table's own axis, the side camera stands on the
+ * carpet beyond the near cushion, and the close camera hangs just off the ball. All three
+ * stay inside {@link CAMERA_REACH_MM}, and so does every pose the rig eases through on the
+ * way between them, which is what stops a transition crossing the seating.
+ *
+ * The look-at heights are the part that is not obvious. A camera this close to the table
+ * cannot hold the near rail, the far cushion and the crowd behind them in one frame while
+ * looking *down* at the cloth: aiming at the bed puts the crowd off the top of the frame,
+ * and aiming at the crowd drops the near rail out of the bottom. So each pose looks at a
+ * point above the cloth and short of the middle, and the field of view below is the span
+ * it leaves on either side of that point — table at the bottom, bowl at the top.
+ * ------------------------------------------------------------------ */
+
+/** Vertical field of view for the wide broadcast camera, in degrees. */
+export const BROADCAST_FOV_DEG = 55
+/** How far behind the baulk cushion the wide camera stands, which puts it on the landing. */
+export const BROADCAST_BACK_MM = 2750
+/** Height of the wide camera above the cloth: a riser, and the tallest fixed view. */
+export const BROADCAST_HEIGHT_MM = 2800
+/** What the wide camera looks at, measured above the cloth. */
+export const BROADCAST_LOOK_HEIGHT_MM = 1200
+
+/** Vertical field of view for the side camera, in degrees. */
+export const SIDE_FOV_DEG = 52
+/**
+ * How far beyond the near cushion the side camera stands, on the carpet.
+ *
+ * The distance is solved from the frame rather than picked: the near cushion's corners are
+ * the widest thing the lens has to hold, and at `SIDE_FOV_DEG` they leave the picture
+ * anywhere inside about 2000mm. Standing back this far keeps both of them, and the whole
+ * bed with them, in a landscape frame while still leaving the table most of the picture.
+ */
+export const SIDE_BACK_MM = 2600
+/** Height of the side camera above the cloth. */
+export const SIDE_HEIGHT_MM = 1600
+/** What the side camera looks at, measured above the cloth. */
+export const SIDE_LOOK_HEIGHT_MM = 400
+
+/** Vertical field of view for the close camera, in degrees. */
+export const CLOSE_FOV_DEG = 34
+/** How far behind the cue ball the close camera hangs, along the table's length. */
+export const CLOSE_BACK_MM = 1600
+/** How far off the shot line it hangs, across the table's width. */
+export const CLOSE_SIDE_MM = 900
+/** Height of the close camera above the cloth: eye level for somebody leaning in. */
+export const CLOSE_HEIGHT_MM = 1400
+
+/**
+ * Aspect below which the wide views start opening up, and how fast they do it.
+ *
+ * A landscape frame holds the near rail, the far cushion and the bowl behind them at the
+ * base field of view. A portrait phone has no width to spare for a table seen almost
+ * end-on, so the lens opens as the canvas narrows — capped by the same ceiling
+ * {@link clampPose} enforces.
+ */
+const WIDE_PORTRAIT_FROM_ASPECT = 1.6
+const WIDE_PORTRAIT_FOV_PER_ASPECT = 20
+const WIDE_PORTRAIT_MAX_EXTRA_DEG = 21
+
+/** One of the wide views' vertical field of view for a canvas of this shape. */
+export function wideFovDeg(base: number, aspect: number): number {
+  const narrow = Math.max(0, WIDE_PORTRAIT_FROM_ASPECT - aspect)
+  return Math.min(MAX_FOV_DEG, base + Math.min(WIDE_PORTRAIT_MAX_EXTRA_DEG, narrow * WIDE_PORTRAIT_FOV_PER_ASPECT))
+}
+
+/** Turns a table-millimetre offset about the origin. How the look-around moves a fixed view. */
+function rotateOffset(dx: number, dy: number, angle: number): { x: number; y: number } {
+  if (angle === 0) return { x: dx, y: dy }
+  const c = Math.cos(angle)
+  const s = Math.sin(angle)
+  return { x: dx * c - dy * s, y: dx * s + dy * c }
+}
+
+/**
+ * The main broadcast camera: wide, elevated, down the length of the table.
+ *
+ * Stands on the camera landing behind the baulk cushion and looks along the bed, which is
+ * the composition the sport is covered in — table across the lower half, hoardings and
+ * the first rows of the bowl above it, the roof left out of frame entirely.
+ */
+export function broadcastPose(aspect: number, orbit: number = 0): CameraPose {
+  const offset = rotateOffset(-(HALF_L + BROADCAST_BACK_MM), 0, orbit)
+  return {
+    x: TABLE_CENTRE.x + offset.x,
+    y: TABLE_CENTRE.y + offset.y,
+    height: BROADCAST_HEIGHT_MM,
+    lookX: TABLE_CENTRE.x,
+    lookY: TABLE_CENTRE.y,
+    lookHeight: BROADCAST_LOOK_HEIGHT_MM,
+    fov: wideFovDeg(BROADCAST_FOV_DEG, aspect)
+  }
+}
+
+/** The side-on table camera: the whole bed across the frame, from beyond the near cushion. */
+export function sidePose(aspect: number, orbit: number = 0): CameraPose {
+  const offset = rotateOffset(0, -(HALF_W + SIDE_BACK_MM), orbit)
+  return {
+    x: TABLE_CENTRE.x + offset.x,
+    y: TABLE_CENTRE.y + offset.y,
+    height: SIDE_HEIGHT_MM,
+    lookX: TABLE_CENTRE.x,
+    lookY: TABLE_CENTRE.y,
+    lookHeight: SIDE_LOOK_HEIGHT_MM,
+    fov: wideFovDeg(SIDE_FOV_DEG, aspect)
+  }
+}
+
+/**
+ * The close camera, hung just off the cue ball.
+ *
+ * The one fixed view that moves: it holds its offset from the ball rather than the table,
+ * so it stays where the player is as they walk the shot in. With no cue ball there is
+ * nothing to hang off, and a camera that invented one would swing across the room on the
+ * first frame — it waits on the wide shot instead.
+ */
+export function closePose(
+  cue: { x: number; y: number } | null,
+  aspect: number,
+  orbit: number = 0
+): CameraPose {
+  if (!cue) return broadcastPose(aspect, orbit)
+  const offset = rotateOffset(-CLOSE_BACK_MM, -CLOSE_SIDE_MM, orbit)
+  return {
+    x: cue.x + offset.x,
+    y: cue.y + offset.y,
+    height: CLOSE_HEIGHT_MM,
+    lookX: cue.x,
+    lookY: cue.y,
+    lookHeight: BALL_RADIUS,
+    fov: wideFovDeg(CLOSE_FOV_DEG, aspect)
+  }
+}
+
 /**
  * Keeps the lens above the cloth and inside a box the table actually occupies.
  *
@@ -396,20 +622,33 @@ export function clampPose(pose: CameraPose): CameraPose {
     height: clamp(pose.height, MIN_CAMERA_HEIGHT_MM, MAX_CAMERA_HEIGHT_MM),
     lookX,
     lookY,
-    lookHeight: clamp(pose.lookHeight, MIN_CAMERA_HEIGHT_MM, MAX_CAMERA_HEIGHT_MM),
+    // lookHeight is the height of the point the camera looks at.
+    // It must be allowed to be at cloth level (0) or below for the AIM camera
+    // which looks ahead at the cloth. Only the camera position (height) is
+    // clamped to stay above the table. The look target can be anywhere in the
+    // horizontal reach range vertically.
+    lookHeight: clamp(pose.lookHeight, -MAX_CAMERA_HEIGHT_MM, MAX_CAMERA_HEIGHT_MM),
     fov: clamp(pose.fov, MIN_FOV_DEG, MAX_FOV_DEG)
   }
 }
 
 /** The pose a request asks for, before any easing. */
 export function resolveCameraTarget(request: CameraRequest): CameraPose {
-  if (request.mode === 'TOP_DOWN') return topDownPose(request.aspect)
+  if (request.mode === 'TOP_DOWN' || request.mode === 'PLACEMENT_TOP_DOWN') return topDownPose(request.aspect)
   if (request.mode === 'TRACK') {
     return request.focus ? trackPose(request.focus, request.aimAngle) : topDownPose(request.aspect)
   }
+  // The three television views are fixed rather than aimed, so they take their heading
+  // from the player's look-around alone and ignore the shot line entirely: turning the
+  // cue must not swing a camera that is meant to be bolted to the floor.
+  if (request.mode === 'BROADCAST') return broadcastPose(request.aspect, request.latch.orbit)
+  if (request.mode === 'SIDE') return sidePose(request.aspect, request.latch.orbit)
+  if (request.mode === 'CLOSE') return closePose(request.cue, request.aspect, request.latch.orbit)
   // With no cue ball there is nothing to sit behind, and a camera that invented one
   // would swing across the table on the first frame. It waits overhead until there is.
-  return request.cue ? aimPose(request.cue, request.aimAngle) : topDownPose(request.aspect)
+  return request.cue
+    ? aimPose(request.cue, request.aimAngle, aimFovDeg(request.aspect))
+    : topDownPose(request.aspect)
 }
 
 /** A rig parked in the overhead view, which is where every match starts. */
@@ -451,7 +690,7 @@ export function stepCameraRig(state: CameraRigState, request: CameraRequest, dt:
   // The other modes resolve normally: their headings come out of their geometry.
   const target =
     request.mode === 'AIM' && request.cue
-      ? aimPose(request.cue, yaw)
+      ? aimPose(request.cue, yaw, aimFovDeg(request.aspect))
       : resolveCameraTarget({ ...request, aimAngle: yaw })
 
   const pose = clampPose(
@@ -463,4 +702,171 @@ export function stepCameraRig(state: CameraRigState, request: CameraRequest, dt:
 /** The heading a pose implies, for tests and for re-seeding the rig. */
 export function poseHeading(pose: CameraPose): number {
   return Math.atan2(pose.lookY - pose.y, pose.lookX - pose.x)
+}
+
+/* ------------------------------------------------------------------ *
+ * Placement camera transitions.
+ *
+ * The cue-ball placement flow needs the camera to fly into the overhead view, hold
+ * there while the player moves the ball, and fly back afterwards, without the player
+ * ever seeing a cut. That is a timed interpolation between two poses rather than a
+ * second camera, so it lives here next to the rig and is testable without a browser.
+ *
+ * The rules that make this a state machine rather than a flag: input is refused for
+ * the whole of a transition (the caller reads {@link PlacementTransition.blocking}), the
+ * transition owns the rig's mode so nothing can fight it mid-flight, and the pose at
+ * either end is the same {@link CameraPose} the rig itself produces, so arriving at
+ * either end is indistinguishable from having arrived there normally.
+ * ------------------------------------------------------------------ */
+
+/** The short end of the recommended placement-transition window, in seconds. */
+export const PLACEMENT_TRANSITION_MIN_SECONDS = 0.5
+/** The long end of it, in seconds: long enough to read as a camera move, short enough not to wait. */
+export const PLACEMENT_TRANSITION_MAX_SECONDS = 1
+/** The default, sitting between the two. */
+export const PLACEMENT_TRANSITION_SECONDS = 0.75
+
+/**
+ * The eased shape of a placement transition, from 0 at the start to 1 at the end.
+ *
+ * Smoothstep, so the camera leaves and arrives at zero speed. A linear move between two
+ * poses is smooth in position but not in velocity: it visibly starts and stops, which is
+ * exactly the "sudden cut" the flow exists to avoid. Smoothstep's derivative is zero at
+ * both ends, so the lens accelerates out of the aim view and settles into the overhead
+ * one without a hitch at either.
+ *
+ * The argument is clamped, so a frame that overshoots the window lands on 1 rather than
+ * extrapolating past the end pose.
+ */
+export function placementTransitionEase(t: number): number {
+  const clamped = Math.max(0, Math.min(1, t))
+  return clamped * clamped * (3 - 2 * clamped)
+}
+
+/** Clamps a requested duration into the window the flow is tuned for. */
+export function clampPlacementTransitionSeconds(seconds: number): number {
+  if (!Number.isFinite(seconds)) return PLACEMENT_TRANSITION_SECONDS
+  return Math.max(PLACEMENT_TRANSITION_MIN_SECONDS, Math.min(PLACEMENT_TRANSITION_MAX_SECONDS, seconds))
+}
+
+/**
+ * Where a placement transition is: which pose it started from, which it is going to,
+ * how far through it is, and whether input is being refused.
+ *
+ * `from` and `to` are snapshots of the two end poses taken when the transition began,
+ * not live lookups. That is deliberate: the aim pose at the end is built from the cue
+ * ball's position, and reading it fresh every frame would let the target move under the
+ * transition and turn it back into the jitter the state machine exists to prevent.
+ */
+export interface PlacementTransition {
+  /** The pose the camera was in when the transition began. */
+  from: CameraPose
+  /** The pose the camera is being taken to. */
+  to: CameraPose
+  /** How far through the transition is, in seconds. */
+  elapsed: number
+  /** How long the whole transition is meant to take, in seconds. */
+  duration: number
+  /** True while the transition is still running. */
+  active: boolean
+  /** True while the transition is running, and input must stay refused. */
+  blocking: boolean
+}
+
+/** A transition that is not happening: the camera is where the player left it. */
+export function noPlacementTransition(): PlacementTransition {
+  return {
+    from: topDownPose(2),
+    to: topDownPose(2),
+    elapsed: 0,
+    duration: PLACEMENT_TRANSITION_SECONDS,
+    active: false,
+    blocking: false
+  }
+}
+
+/**
+ * Begins a transition from where the rig is now to `to`, over `seconds`.
+ *
+ * `seconds` is clamped into the 0.5-1.0s window, so a caller cannot ask for a cut. The
+ * returned transition is blocking from its first frame: input is refused the moment the
+ * move starts, not once it is under way.
+ */
+export function beginPlacementTransition(
+  from: CameraPose,
+  to: CameraPose,
+  seconds: number = PLACEMENT_TRANSITION_SECONDS
+): PlacementTransition {
+  return {
+    from: { ...from },
+    // The end pose is clamped on the way in, not on the way out. Interpolating towards an
+    // unclamped endpoint and clamping the interpolated result instead would mean the
+    // move's arrival point drifts as it goes - and would make the pose reached on the
+    // final frame depend on where the camera happened to be when it started. Clamping
+    // here makes the endpoint exactly the pose the rig itself would hold.
+    to: clampPose(to),
+    elapsed: 0,
+    duration: clampPlacementTransitionSeconds(seconds),
+    active: true,
+    blocking: true
+  }
+}
+
+/**
+ * Advances a transition by `dt` and hands back the pose the camera should be at.
+ *
+ * The pose is a straight interpolation of the two endpoints along the eased curve: no
+ * component is solved, moved or recomputed from the table, so the camera's position,
+ * height, look-at point and field of view all move together along one path and the
+ * frame cannot arrive somewhere its neighbours would not. The result is clamped like any
+ * other pose, so a transition is as bounded as the states at either end of it.
+ *
+ * When the window closes the transition is marked finished, so the caller can hand
+ * control back. The pose returned on that frame is exactly the end pose, not the last
+ * eased step short of it, so there is no visible snap on the frame the input is released.
+ */
+export function stepPlacementTransition(
+  transition: PlacementTransition,
+  dt: number
+): { pose: CameraPose; transition: PlacementTransition } {
+  if (!transition.active) {
+    return { pose: transition.to, transition }
+  }
+  // Not clamped at the top, the way the rig's own `dt` is. The rig damps towards a
+  // target, so discarding a long frame just means it converges a little further next
+  // time. This is a move with an end time: a frame that overshoots the window has to
+  // land on the end pose, or a tab that was in the background comes back to a camera
+  // stranded part of the way across the table, still refusing input.
+  const elapsed = transition.elapsed + Math.max(0, dt)
+  const done = elapsed >= transition.duration
+  const t = done ? 1 : placementTransitionEase(elapsed / transition.duration)
+  const lerp = (a: number, b: number): number => a + (b - a) * t
+  const pose = clampPose({
+    x: lerp(transition.from.x, transition.to.x),
+    y: lerp(transition.from.y, transition.to.y),
+    height: lerp(transition.from.height, transition.to.height),
+    lookX: lerp(transition.from.lookX, transition.to.lookX),
+    lookY: lerp(transition.from.lookY, transition.to.lookY),
+    lookHeight: lerp(transition.from.lookHeight, transition.to.lookHeight),
+    fov: lerp(transition.from.fov, transition.to.fov)
+  })
+  return {
+    pose,
+    transition: {
+      ...transition,
+      elapsed,
+      active: !done,
+      blocking: !done
+    }
+  }
+}
+
+/**
+ * The pose a transition has arrived at, for callers that want the end state directly.
+ *
+ * Identical to the last {@link stepPlacementTransition} result; named so the scene does
+ * not have to reach into the transition's fields to hand a pose back to the rig.
+ */
+export function placementTransitionEndPose(transition: PlacementTransition): CameraPose {
+  return transition.active ? transition.from : transition.to
 }

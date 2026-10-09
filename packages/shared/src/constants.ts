@@ -61,9 +61,11 @@ export const GRAVITY_MM_S2 = 9810
  * simulation uses is the one the tests read.
  */
 export const ROLL_FRICTION = CLOTH_CRR * GRAVITY_MM_S2
-// Fractional spin bleed-off per second: spin retains (1 - SPIN_FRICTION)^TICK_RATE
+// Fractional topspin/backspin bleed-off per second: retains (1 - SPIN_FRICTION)^TICK_RATE
 // each second, i.e. about 37% per second at 1.
 export const SPIN_FRICTION = 1
+// Sidespin lasts longer on cloth than vertical tip spin.
+export const SIDE_SPIN_FRICTION = 0.55
 export const MIN_SPEED = 1.5
 export const MAX_CUE_SPEED = 9000
 
@@ -75,6 +77,12 @@ export const DRAW_IMPULSE = 0.1
 // Spin-induced throw, in degrees of object-ball deflection at full side spin.
 // A bounded rotation, so it cannot add energy to the collision.
 export const SIDE_SPIN_THROW_DEG = 3
+// Fraction of cue tip-spin copied onto the object ball at contact.
+export const SPIN_TRANSFER = 0.18
+// Tangential rebound nudge from sidespin as a fraction of post-bounce normal speed.
+export const CUSHION_SIDESPIN_KICK = 0.04
+// How fast angularVel catches natural roll (v/R) while still sliding, in 1/s.
+export const SLIDE_ROLL_CATCHUP = 6
 
 export const TICK_RATE = 120
 export const TICK_DT = 1 / TICK_RATE
@@ -141,6 +149,17 @@ export const COLOR_NAMES: Record<number, string> = {
 }
 
 export const TOTAL_REDS = 15
+
+/**
+ * The product's name, in one place.
+ *
+ * `index.html` cannot import it, so its `<title>` is the one copy that has to be typed
+ * out again; everything rendered in the app reads this, which is what keeps the wordmark
+ * from drifting between the header and the home screen. The login and admin-login screens
+ * deliberately keep the old name and type their own title, so nothing about them moves
+ * with this constant.
+ */
+export const APP_TITLE = 'SnookerX'
 
 export const PRACTICE_AI_LEVELS = ['EASY', 'MEDIUM', 'HARD'] as const
 export type PracticeAiLevel = (typeof PRACTICE_AI_LEVELS)[number]

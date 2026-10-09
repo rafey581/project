@@ -1,5 +1,7 @@
-﻿import { BALL_IDS, COLOR_NAMES, COLOR_ORDER, COLOR_VALUES, TOTAL_REDS } from '@snooker/shared'
+import { BALL_IDS, COLOR_NAMES, COLOR_ORDER, COLOR_VALUES, TOTAL_REDS } from '@snooker/shared'
 import { ballColorHex } from './palette.js'
+import { createAvatarSlot, updateAvatarSubject } from './avatar.js'
+import type { AvatarSlot } from './avatar.js'
 import {
   clampPowerLoose,
   easePower,
@@ -198,7 +200,7 @@ export function deriveHudState(input: HudInput): HudState {
    * Every score in a snapshot is keyed by seat, the same way `turnIndex` is: seat 0's
    * points are `scores.player0`, whoever happens to be sitting there. So the scores are
    * read by seat and the sides are decided by where this client is sitting, rather than
-   * the other way round ΓÇö otherwise a client in seat 1 is shown the other player's score
+   * the other way round — otherwise a client in seat 1 is shown the other player's score
    * under their own name, and the score readout exists to make exactly that impossible.
    */
   const pointsForSeat = (s: number): number | null => (s === 0 ? snapshot?.scores.player0 : snapshot?.scores.player1) ?? null
@@ -261,8 +263,8 @@ export function deriveHudState(input: HudInput): HudState {
     prize: showResult && input.prizeCredits > 0 ? formatCredits(input.prizeCredits) : null,
     frames: showResult ? `${framesWon[0]} : ${framesWon[1]}` : null,
     frameLabel: input.practice
-      ? `Practice ┬╖ frame ${input.frameIndex}`
-      : `Frame ${input.frameIndex} ┬╖ ${input.format}`,
+      ? `Practice - Frame ${input.frameIndex}`
+      : `Frame ${input.frameIndex} - ${input.format}`,
     breakLabel: snapshot && snapshot.breakScore > 0 ? `Break ${snapshot.breakScore}` : null,
     ballOnLabel: describeBallOn(snapshot?.ballOn),
     ballOnValue: onColour !== null ? (COLOR_VALUES[onColour] ?? null) : (snapshot?.ballOn ?? 'RED') === 'RED' ? 1 : null,
@@ -303,14 +305,14 @@ function setFlag(node: HTMLElement, className: string, on: boolean): void {
  * Writes a score and flashes it when the number actually moved.
  *
  * Built on setText so an unchanged score costs nothing, and so the flash is driven
- * by the change rather than by the update ΓÇö a score that is re-sent every frame
+ * by the change rather than by the update — a score that is re-sent every frame
  * because the opponent is thinking must not strobe once a second. The class has to
  * be removed and re-added to restart the keyframe, hence the reflow-forcing read.
  */
 function setScore(node: HTMLElement, value: string): void {
   if (node.textContent === value) return
   node.textContent = value
-  // Clearing the score is not a scoring event ΓÇö the node is about to be hidden
+  // Clearing the score is not a scoring event — the node is about to be hidden
   // anyway, and flashing an empty box reads as a glitch rather than an achievement.
   if (value === '') return
   node.classList.remove('tick-up')
@@ -325,101 +327,13 @@ function setHidden(node: HTMLElement, hidden: boolean): void {
 }
 
 /**
- * A stable colour per name, so two players on the same table never look like the
- * same avatar. Derived from the name rather than stored, which keeps the HUD free of
- * any per-user state it would have to keep in step with the server.
- */
-function hueFor(name: string): number {
-  let hash = 0
-  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) % 360
-  return hash
-}
-
-const ROBOT_SVG =
-  '<svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">' +
-  '<path d="M16 2.5a1.4 1.4 0 0 1 1.4 1.4v3.2h-2.8V3.9A1.4 1.4 0 0 1 16 2.5Z" fill="#9fd8f2"/>' +
-  '<rect x="3.5" y="7.5" width="25" height="18" rx="5" fill="#9fd8f2"/>' +
-  '<circle cx="11" cy="15" r="2.6" fill="#14181f"/><circle cx="21" cy="15" r="2.6" fill="#14181f"/>' +
-  '<rect x="10" y="20.5" width="12" height="2.4" rx="1.2" fill="#14181f"/>' +
-  '</svg>'
-
-interface AvatarSlot {
-  frame: HTMLElement
-  image: HTMLImageElement
-  glyph: HTMLElement
-  lastUrl: string | null
-  lastMode: '' | 'bot' | 'letter'
-  lastInitial: string
-  lastHue: number
-}
-
-/**
- * An avatar, built once.
+ * An avatar frame, drawn and then given the turn highlight on top.
  *
- * The real profile picture is a slot rather than a feature: if a caller ever supplies
- * a URL the image is used and the generated default steps aside. Until then the
- * default is a letter for a human and a robot for the bot, both drawn here so the
- * HUD needs no image files.
+ * The picture itself comes from `avatar.ts`, shared with the screens outside a match;
+ * only the turn flag is the HUD's, because only the HUD knows whose visit it is.
  */
-function createAvatar(frameId: string, turnKey: 'you' | 'opponent'): AvatarSlot {
-  const frame = el('div', 'hud-frame')
-  frame.id = frameId
-  frame.dataset.hudTurnFrame = turnKey
-
-  const image = document.createElement('img')
-  image.className = 'hud-avatar-img'
-  image.alt = ''
-  image.hidden = true
-
-  const glyph = el('div', 'hud-avatar-glyph')
-  frame.append(image, glyph)
-
-  return {
-    frame,
-    image,
-    glyph,
-    lastUrl: null,
-    lastMode: '',
-    lastInitial: '',
-    lastHue: -1
-  }
-}
-
 function updateAvatar(slot: AvatarSlot, side: HudSide): void {
-  const url = side.avatarUrl
-  setHidden(slot.image, !url)
-  setHidden(slot.glyph, Boolean(url))
-  if (url) {
-    if (slot.lastUrl !== url) {
-      slot.image.src = url
-      slot.lastUrl = url
-    }
-  } else {
-    if (slot.lastUrl !== null) {
-      slot.image.removeAttribute('src')
-      slot.lastUrl = null
-    }
-    const mode = side.isBot ? 'bot' : 'letter'
-    if (slot.lastMode !== mode) {
-      if (mode === 'bot') slot.glyph.innerHTML = ROBOT_SVG
-      else slot.glyph.textContent = ''
-      // Lets the stylesheet tint a letter without also tinting the robot.
-      slot.glyph.dataset.mode = mode
-      slot.lastMode = mode
-    }
-    if (mode === 'letter') {
-      const initial = (side.name.trim()[0] ?? '?').toUpperCase()
-      if (slot.lastInitial !== initial) {
-        slot.glyph.textContent = initial
-        slot.lastInitial = initial
-      }
-      const hue = hueFor(side.name)
-      if (slot.lastHue !== hue) {
-        slot.glyph.style.setProperty('--avatar-hue', String(hue))
-        slot.lastHue = hue
-      }
-    }
-  }
+  updateAvatarSubject(slot, side)
   setFlag(slot.frame, TURN_ACTIVE_CLASS, side.active)
   if (slot.frame.dataset.turn !== (side.active ? '1' : '0')) {
     slot.frame.dataset.turn = side.active ? '1' : '0'
@@ -428,6 +342,23 @@ function updateAvatar(slot: AvatarSlot, side: HudSide): void {
 
 export interface Hud {
   root: HTMLElement
+  /**
+   * An empty slot in the top-left of the bar, for the session controls.
+   *
+   * Leave, sound, finish, fullscreen and help all act on the session rather than on the
+   * frame, and each of them needs a handler the HUD cannot reach, so the HUD supplies the
+   * space and the caller fills it.
+   */
+  toolsRoot: HTMLElement
+  /**
+   * An empty slot in the top-right of the bar, for the rest of the session controls.
+   *
+   * Sound, finish, fullscreen and the controls popover. Separate from `toolsRoot` because
+   * they are grouped by how often they are wanted rather than by what they act on: leaving
+   * is once a session, these are occasionally, and a top-left column has no room for four
+   * more buttons beside a score capsule.
+   */
+  sessionToolsRoot: HTMLElement
   /** Mounted inside the table frame: the power rail, which overlays the table. */
   overlayRoot: HTMLElement
   /** The spin dial, mounted inside the table frame on the side opposite the rail. */
@@ -477,7 +408,7 @@ function sideNodes(nameId: string, pointsId: string): { name: HTMLElement; point
  *
  * It is HTML laid over the canvas rather than anything drawn into it, which is what
  * makes the 3D scene and the 2D fallback show the same match: neither renderer knows
- * this component exists. It is also why it must not be rebuilt on a frame ΓÇö the
+ * this component exists. It is also why it must not be rebuilt on a frame — the
  * nodes are created once here and every later write is diffed against what is
  * already there.
  */
@@ -488,35 +419,96 @@ export function createHud(): Hud {
   const top = el('div', 'hud-top')
   top.id = 'hud-top'
 
-  const youAvatar = createAvatar('hud-frame-you', 'you')
-  const oppAvatar = createAvatar('hud-frame-opp', 'opponent')
+  const youAvatar = createAvatarSlot({ frameId: 'hud-frame-you', turnKey: 'you' })
+  const oppAvatar = createAvatarSlot({ frameId: 'hud-frame-opp', turnKey: 'opponent' })
   const youNames = sideNodes('hud-you', 'hud-points-you')
   const oppNames = sideNodes('hud-opp', 'hud-points-opp')
 
+  /**
+   * A player, as one end of the score capsule.
+   *
+   * Avatar, name and the frame's points, with the turn highlight and the shot clock both
+   * living on the avatar frame. The points keep the ids they have always had: they were
+   * built for the two ends of a scoreline and have only moved, so anything reading them by
+   * id still finds them.
+   *
+   * The order is reversed for the opponent, so the capsule reads avatar-name | score |
+   * name-avatar: each player is nearest their own number, which is the only arrangement
+   * where a swapped score is visible rather than merely possible.
+   */
+  function capsuleSide(
+    avatar: AvatarSlot,
+    side: { name: HTMLElement },
+    modifier: string
+  ): HTMLElement {
+    const node = el('div', `hud-capsule-side ${modifier}`)
+    node.append(avatar.frame, side.name)
+    return node
+  }
+
   const left = el('div', 'hud-side hud-left')
-  left.append(youNames.name)
-  const right = el('div', 'hud-side hud-right')
-  right.append(oppNames.name)
+  /*
+   * The session tools mount in this slot and are built by the caller, not here: leaving and
+   * the camera toggle act on the session rather than on the frame, and the HUD is not
+   * allowed to know how to end a match. An empty box the caller fills keeps that dependency
+   * pointing one way. It is a column, not a row: these are the two controls a player reaches
+   * for between shots, and a column keeps them clear of the score capsule in the middle.
+   */
+  const tools = el('div', 'hud-tools hud-tools--left')
+  tools.id = 'hud-tools'
+  left.appendChild(tools)
 
   /**
-   * The score readout, in the centre of the bar.
+   * The other session tools, top right.
    *
-   * Avatar, that player's frame points, a rule, the other player's frame points, their
-   * avatar ΓÇö the shape of a scoreline rather than a pair of numbers in opposite corners.
-   * The avatars sit inside it rather than at the ends of the bar because the points they
-   * belong to are what is being read, and a number next to a face is a scoreline. The
-   * turn highlight rides on the avatar frame, so whoever is at the table is still found
-   * by the same class on the same element, and the shot clock still hangs inside it.
+   * A second mount rather than a continuation of the first because these are grouped by
+   * how often they are used, not by what they act on: leaving is once a session, the rest
+   * are occasionally, and putting them in one row put five buttons in the corner nearest
+   * the score. Sound, finish, fullscreen and the controls popover are here instead, and the
+   * caller fills them in the same way it fills the top-left slot.
    */
-  const score = el('div', 'hud-score')
-  score.id = 'hud-score'
-  const sep = el('span', 'hud-score-sep')
-  // Decoration: the two numbers are already separated by being on either side of it,
-  // so a screen reader is not told about a rule that carries no meaning.
-  sep.setAttribute('aria-hidden', 'true')
-  score.append(youAvatar.frame, youNames.points, sep, oppNames.points, oppAvatar.frame)
+  const sessionTools = el('div', 'hud-tools hud-tools--right')
+  sessionTools.id = 'hud-tools-right'
+  const right = el('div', 'hud-side hud-right')
+  right.appendChild(sessionTools)
 
   const centre = el('div', 'hud-centre')
+
+  /**
+   * The score capsule: the one pane in the middle of the top edge.
+   *
+   * One glass pill holding both players and the scoreline between them, rather than two
+   * player pills either side of a separate score. Three reasons, all of them about the
+   * table being the subject: the two names stop being the largest thing on the screen, the
+   * scoreline cannot drift out of step with the names it belongs to, and one pill over the
+   * cloth is one thing to look past rather than three.
+   *
+   * The two points keep the ids and the `tick-up` flash they have always had, so a score
+   * that moves is still announced by the number itself moving.
+   */
+  const capsule = el('div', 'hud-capsule hud-glass')
+  capsule.id = 'hud-capsule'
+  const youSide = capsuleSide(youAvatar, youNames, 'hud-capsule-side--you')
+  const oppSide = capsuleSide(oppAvatar, oppNames, 'hud-capsule-side--opponent')
+  const score = el('div', 'hud-score')
+  const sep = el('div', 'hud-score-sep')
+  sep.setAttribute('aria-hidden', 'true')
+  sep.textContent = ':'
+  score.append(youNames.points, sep, oppNames.points)
+  capsule.append(youSide, score, oppSide)
+
+  /**
+   * What the ball on is, and how many reds are left, are gone.
+   *
+   * Both were chips in the middle of the top edge: a red dot with a count, and a "Ball on:
+   * red +1" with a coloured dot. Neither is on the screen any more, and nothing has taken
+   * their place — a HUD that names the next ball is a HUD telling the player what to think
+   * about instead of what to see. The facts themselves are untouched: `deriveHudState`
+   * still computes `reds`, `colours`, `redsOn`, `ballOnLabel`, `ballOnValue` and
+   * `ballOnDot`, and they are still part of the state, because that is a description of the
+   * table and not a decision about what to draw.
+   */
+
   const prize = el('div', 'hud-prize')
   prize.id = 'hud-prize'
   const frames = el('div', 'hud-frames')
@@ -526,7 +518,38 @@ export function createHud(): Hud {
   const inHand = el('div', 'hud-inhand')
   inHand.id = 'hud-inhand'
   inHand.hidden = true
-  centre.append(score, prize, frames, frameLabel, inHand)
+  // One very quiet line under the capsule: which frame this is, and — in a staked match —
+  // what it is worth and where the frames stand. These are facts about the session rather
+  // than about the table, so they are reference text and get none of the capsule's weight.
+  const sub = el('div', 'hud-sub')
+  sub.append(frameLabel, frames, prize)
+
+  /**
+   * The one line of gameplay state that is still on the screen.
+   *
+   * Ball in hand is the whole of it, and it is genuinely transient: it is true for exactly
+   * as long as the cue ball is in a player's hand. It sits directly under the capsule as a
+   * small glass toast rather than in the row beside the frame label, because it is the only
+   * thing on this screen that changes what the player is allowed to do next.
+   *
+   * The event messages go into the same stack, underneath it. They were absolutely
+   * positioned across the middle of the table, which meant a foul covered the cloth while
+   * it was being read, and every message on the screen competed with the table. Here they
+   * queue under the capsule in the one place a HUD should be talking from, and the layer is
+   * still just a container: nothing about how a message is announced has changed, only
+   * where it appears.
+   */
+  const toast = el('div', 'hud-toast')
+  toast.id = 'hud-toast'
+  toast.appendChild(inHand)
+
+  // Built once, reused; each flash appends a short-lived child that animates itself in and
+  // out. Still driven by the same three classes and the same timers as before.
+  const eventLayer = el('div', 'event-banner-layer')
+  eventLayer.id = 'event-banner-layer'
+  toast.appendChild(eventLayer)
+
+  centre.append(capsule, sub, toast)
 
   top.append(left, centre, right)
 
@@ -537,46 +560,6 @@ export function createHud(): Hud {
   live.id = 'hud-turn'
   live.setAttribute('role', 'status')
   live.setAttribute('aria-live', 'polite')
-
-  const strip = el('div', 'hud-balls')
-  strip.id = 'hud-balls'
-  const reds = el('div', 'hud-reds')
-  const redDots = el('div', 'hud-red-dots')
-  for (let i = 0; i < TOTAL_REDS; i++) {
-    const dot = el('span', 'hud-red-dot')
-    redDots.appendChild(dot)
-  }
-  const redCount = el('span', 'hud-red-count')
-  redCount.id = 'hud-reds-count'
-  reds.append(redDots, redCount)
-
-  const ballOn = el('div', 'hud-ball-on')
-  ballOn.id = 'hud-ball-on'
-  const ballOnText = el('span', 'hud-ball-on-text')
-  // The badge: what the ball on is worth. A red reads +1, a colour its own
-  // value, so the shot's stake is on the strip and not only in the rules.
-  const ballOnValue = el('span', 'hud-ball-on-value')
-  ballOnValue.id = 'hud-ball-on-value'
-  ballOnValue.hidden = true
-  const brk = el('span', 'hud-break')
-  brk.id = 'hud-break'
-  ballOn.append(ballOnText, ballOnValue, brk)
-
-  // Center-screen event banners: fouls, pots, ball in hand. Built once, reused;
-  // each flash appends a short-lived child that animates itself in and out.
-  const eventLayer = el('div', 'event-banner-layer')
-  eventLayer.id = 'event-banner-layer'
-
-  const colours = el('div', 'hud-colours')
-  for (const id of COLOR_ORDER) {
-    const chip = el('span', 'hud-ball')
-    chip.dataset.ball = String(id)
-    chip.style.setProperty('--ball', ballColorHex(id))
-    chip.title = `${COLOR_NAMES[id] ?? 'colour'} ΓÇö ${COLOR_VALUES[id] ?? 0}`
-    colours.appendChild(chip)
-  }
-
-  strip.append(reds, ballOn, colours)
 
   /**
    * The power rail, laid over the side of the table.
@@ -602,7 +585,7 @@ export function createHud(): Hud {
    * The visible rail is aria-hidden, so the semantics live on this element: it takes
    * focus, speaks the range, and answers the keyboard. It precedes the track in the
    * DOM so the stylesheet can draw the focus ring on the track behind it, and it
-   * ignores the pointer ΓÇö the track below is the hit target ΓÇö so a click and a key
+   * ignores the pointer — the track below is the hit target — so a click and a key
    * press are two ways into the same value rather than two controls.
    */
   const slider = el('div', 'power-slider')
@@ -652,8 +635,8 @@ export function createHud(): Hud {
   /**
    * Registers where the slider hands its value.
    *
-   * The HUD cannot import the cue controller ΓÇö the dependency points the other way,
-   * controller ΓåÆ HUD for display ΓÇö so the caller connects the two here at mount.
+   * The HUD cannot import the cue controller — the dependency points the other way,
+   * controller → HUD for display — so the caller connects the two here at mount.
    */
   function setPowerSink(sink: (power: number) => void): void {
     aimPowerSetter = sink
@@ -684,7 +667,7 @@ export function createHud(): Hud {
     stopSliderReset()
     // Capture is locked at pointerdown on the track itself, so every later move and
     // the release arrive here even when the cursor swings off the rail across the
-    // table ΓÇö the handle follows the pointer one-to-one with no jumping. The drag
+    // table — the handle follows the pointer one-to-one with no jumping. The drag
     // also locks the cue controller's power writes for the gesture (via the caller),
     // so nothing can decay the value underneath the finger.
     railTrack.setPointerCapture(event.pointerId)
@@ -713,7 +696,7 @@ export function createHud(): Hud {
   railTrack.addEventListener('pointercancel', onRailPointerUp)
   // Safety net for a lost or failed capture: with capture working, the track handler
   // has already ended the drag and this returns early; without it, a release outside
-  // the track would never be seen here and the drag ΓÇö and with it the power lock ΓÇö
+  // the track would never be seen here and the drag — and with it the power lock —
   // would stick on until the next turn.
   window.addEventListener('pointerup', endRailDrag)
   window.addEventListener('pointercancel', endRailDrag)
@@ -722,13 +705,13 @@ export function createHud(): Hud {
    * The spin dial: a cue ball face-on in the bottom-left of the table frame, the
    * power rail's opposite side. One circle, one crosshair, one dot; the dot's
    * distance from centre is the strike offset, its direction the spin's blend of
-   * follow/draw and side. It is a view of ΓÇö and a second way into ΓÇö the same spin
+   * follow/draw and side. It is a view of — and a second way into — the same spin
    * value the arrow keys already set, never a second value.
    */
   const spinDial = el('div', 'spin-dial')
   spinDial.id = 'spin-dial'
   spinDial.setAttribute('role', 'application')
-  spinDial.setAttribute('aria-label', 'Spin control ΓÇö drag the dot off centre; up topspin, down backspin, left and right side')
+  spinDial.setAttribute('aria-label', 'Spin control — drag the dot off centre; up topspin, down backspin, left and right side')
   spinDial.tabIndex = 0
 
   const dialBall = el('div', 'spin-dial-ball')
@@ -855,7 +838,7 @@ export function createHud(): Hud {
     sliderResetFrame = 0
   }
 
-  root.append(top, strip, live, eventLayer)
+  root.append(top, live, eventLayer)
   // The dial rides the game overlay like the power rail does, so it sits over
   // the cloth it applies to; the caller mounts the overlay inside the frame.
   overlay.appendChild(spinDial)
@@ -865,14 +848,10 @@ export function createHud(): Hud {
   // state changes and would otherwise have to be called every frame to animate.
   let railShown = 0
 
-  const redDotNodes = [...redDots.children] as HTMLElement[]
-  const colourNodes = new Map<number, HTMLElement>()
-  for (const chip of [...colours.children] as HTMLElement[]) {
-    colourNodes.set(Number(chip.dataset.ball), chip)
-  }
-
   return {
     root,
+    toolsRoot: tools,
+    sessionToolsRoot: sessionTools,
     overlayRoot: overlay,
     spinDialRoot: spinDial,
     update: (state: HudState) => {
@@ -891,30 +870,7 @@ export function createHud(): Hud {
       setHidden(frames, state.frames === null)
       setText(frameLabel, state.frameLabel)
       setHidden(inHand, !state.cueInHand)
-      setText(inHand, state.cueInHandInD ? 'Ball in hand ΓÇö place the cue in the D' : 'Ball in hand ΓÇö place the cue anywhere on the table')
-      setText(ballOnText, state.ballOnLabel)
-      setText(brk, state.breakLabel ?? '')
-      setHidden(brk, state.breakLabel === null)
-      if (state.ballOnValue !== null && state.ballOnDot !== null) {
-        setText(ballOnValue, `+${state.ballOnValue}`)
-        ballOnValue.style.setProperty('--badge-dot', state.ballOnDot)
-        setHidden(ballOnValue, false)
-      } else {
-        setHidden(ballOnValue, true)
-      }
-
-      setText(redCount, `${state.reds.remaining}`)
-      redCount.title = `${state.reds.remaining} of ${state.reds.total} reds left`
-      for (let i = 0; i < redDotNodes.length; i++) {
-        setFlag(redDotNodes[i]!, 'is-potted', state.reds.onTable[i] === false)
-      }
-      setFlag(strip, 'reds-on', state.redsOn)
-      for (const chip of state.colours) {
-        const node = colourNodes.get(chip.id)
-        if (!node) continue
-        setFlag(node, 'is-potted', !chip.onTable)
-        setFlag(node, 'is-on', chip.on)
-      }
+      setText(inHand, state.cueInHandInD ? 'Ball in hand - place the cue in the D' : 'Ball in hand - place the cue anywhere on the table')
 
       const turnText = state.you.active ? 'Your turn' : state.opponent.active ? `${state.opponent.name} to play` : ''
       if (live.textContent !== turnText) live.textContent = turnText
@@ -945,8 +901,8 @@ export function createHud(): Hud {
       setFlag(rail, 'is-disabled', !enabled)
       slider.setAttribute('aria-disabled', enabled ? 'false' : 'true')
       if (!enabled) {
-        // A turn ending or a shot firing mid-drag has to end the gesture outright ΓÇö
-        // including handing power writes back to the controller ΓÇö or the lock would
+        // A turn ending or a shot firing mid-drag has to end the gesture outright —
+        // including handing power writes back to the controller — or the lock would
         // outlive the drag and leave the cue stuck on a number nobody is setting.
         railDragging = false
         sliderDriving = false
